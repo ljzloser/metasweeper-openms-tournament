@@ -1,0 +1,1025 @@
+"""宿主插件适配；OpenMS 请求不使用生成客户端或服务插件。"""
+from __future__ import annotations
+
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from time import monotonic
+from typing import Callable
+
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QIcon
+
+from plugin_sdk import BasePlugin, BoolConfig, IntConfig, OtherInfoBase, PluginInfo, TextConfig, WindowMode
+from shared_types import (
+    GameStatusChangeEvent, GetGameContextQuery,
+    GameContextResult, SetRaceIdentifierCommand, GameBoardState,
+)
+from shared_types.events import GameFinishedEvent
+
+from .client import LoginUser, OpenmsClient, OpenmsError, Participant, Snapshot, Tournament, UploadError
+from .uploads import UploadJob, UploadQueue
+from .analysis import analyze_personal
+from .request_policy import RateLimitError
+from .widgets import TournamentWidget
+
+
+class TournamentConfig(OtherInfoBase):
+    user_id = IntConfig(
+        0, "OpenMS 用户 ID", min_value=0, max_value=2_147_483_647,
+        description="OpenMS 个人主页对应的数字用户 ID；0 表示未配置，仍可浏览比赛。",
+    )
+    timeout_seconds = IntConfig(8, "请求超时（秒）", min_value=3, max_value=30)
+    username = TextConfig("", "OpenMS 用户名", description="登录后自动保存，方便下次填写。")
+    login_expiry_days = IntConfig(
+        30, "保持登录天数", min_value=7, max_value=90,
+        description="OpenMS 支持 7–90 天，默认 30 天。",
+    )
+    auto_manage_identifier = BoolConfig(
+        True, "自动维护比赛标识",
+        description="每 5 分钟检查已打卡比赛，并在主程序待开局时自动设置有效标识。",
+    )
+    auto_upload = BoolConfig(
+        False, "自动上传比赛录像",
+        description="上传开启后完成的公平正式标准模式比赛胜局；网站已存在时丢弃待上传副本。",
+    )
+
+
+class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
+    _finished = Signal(int, str, object, object)
+    _auth_finished = Signal(int, str, object, object)
+    _auto_check_interval_ms = 5 * 60 * 1000
+
+    @classmethod
+    def plugin_info(cls) -> PluginInfo:
+        return PluginInfo(
+            name="openms_tournament", display_name="OpenMS 比赛", version="1.10.1",
+            description="查看比赛、批量打卡、维护比赛标识、检查对局条件、上传录像并分析本人比赛成绩。",
+            window_mode=WindowMode.TAB, other_info=TournamentConfig,
+            icon=QIcon(str(Path(__file__).with_name("icon.svg"))),
+            required_controls=[SetRaceIdentifierCommand],
+        )
+
+    def __init__(self, info: PluginInfo):
+        super().__init__(info)
+        self._executor: ThreadPoolExecutor | None = None
+        self._future: Future | None = None
+        self._epoch = 0
+        self._stopping = True
+        self._snapshot: Snapshot | None = None
+        self._selected: Tournament | None = None
+        self._participant: Participant | None = None
+        self._http: OpenmsClient | None = None
+        self._login_user: LoginUser | None = None
+        self._captcha_key = ""
+        self._auth_epoch = 0
+        self._auth_busy = False
+        self._auth_future: Future | None = None
+        self._checkin_id: int | None = None
+        self._checkin_all_busy = False
+        self._refresh_selection_id: int | None = None
+        self._explicit_apply_all_pending = False
+        self._auto_retry_after = 0.0
+        self._latest_game_context: GameContextResult | None = None
+        self._network_kind: str | None = None
+        self._poll_timer: QTimer | None = None
+        self._context_poll_timer: QTimer | None = None
+        self._context_debounce: QTimer | None = None
+        self._upload_timer: QTimer | None = None
+        self._uploads: UploadQueue | None = None
+        self._upload_current: UploadJob | None = None
+        self._upload_after = 0.0
+        self._upload_record_cache: list[dict] | None = None
+        self._analysis_target: tuple[int, int] | None = None
+        self._finished.connect(self._on_finished, Qt.ConnectionType.QueuedConnection)
+        self._auth_finished.connect(self._on_auth_finished, Qt.ConnectionType.QueuedConnection)
+        self.config_changed.connect(self._config_changed)
+
+    def _setup_subscriptions(self):
+        self.subscribe(GameStatusChangeEvent, self._on_game_status_change)
+        self.subscribe(GameFinishedEvent, self._on_game_finished)
+
+    def _create_widget(self):
+        widget = TournamentWidget(
+            self._login_user.id if self._login_user else self.other_info.user_id,
+            username=self.other_info.username,
+            auto_manage=self.other_info.auto_manage_identifier,
+            auto_upload=self.other_info.auto_upload,
+        )
+        widget.refresh_requested.connect(self._refresh)
+        widget.user_id_saved.connect(self._save_user_id)
+        widget.tournament_selected.connect(self._select_tournament)
+        widget.apply_requested.connect(self._apply)
+        widget.captcha_requested.connect(self._refresh_captcha)
+        widget.login_requested.connect(self._login)
+        widget.login_check_requested.connect(self._check_login)
+        widget.logout_requested.connect(self._logout)
+        widget.check_in_requested.connect(self._check_in)
+        widget.check_in_all_requested.connect(self._check_in_all)
+        widget.auto_manage_changed.connect(self._set_auto_manage_identifier)
+        widget.username_saved.connect(self._save_username)
+        widget.auto_upload_changed.connect(self._set_auto_upload)
+        widget.upload_history_requested.connect(self._show_upload_records)
+        widget.retry_uploads_requested.connect(self._retry_uploads)
+        widget.analysis_requested.connect(self._analyze_personal)
+        widget.show_login_user(self._login_user)
+        widget.set_auth_busy(self._auth_busy)
+        widget.set_authorized(self.has_control_auth(SetRaceIdentifierCommand))
+        if self._uploads is not None:
+            widget.set_upload_records(self._uploads.records())
+        return widget
+
+    def on_widget_created(self, widget):
+        self._enqueue_event(lambda _: (self._refresh(), self._refresh_game_context()), None)
+
+    def on_initialized(self):
+        self._stopping = False
+        self._future = self._auth_future = None
+        self._upload_current = None
+        self._upload_after = 0.0
+        self._upload_record_cache = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openms-tournament")
+        self._uploads = UploadQueue(Path(self.data_dir) / "uploads.sqlite3")
+        self._upload_timer = QTimer(self)
+        self._upload_timer.setInterval(1000)
+        self._upload_timer.timeout.connect(self._process_upload_queue)
+        self._upload_timer.start()
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(self._auto_check_interval_ms)
+        self._poll_timer.timeout.connect(self._on_poll_timeout)
+        self._poll_timer.start()
+        self._context_debounce = QTimer(self)
+        self._context_debounce.setSingleShot(True)
+        self._context_debounce.setInterval(250)
+        self._context_debounce.timeout.connect(self._on_context_debounce)
+        self._context_poll_timer = QTimer(self)
+        self._context_poll_timer.setInterval(3000)
+        self._context_poll_timer.timeout.connect(self._refresh_game_context)
+        self._context_poll_timer.start()
+        if self.other_info.login_expiry_days < 7:
+            self.other_info.login_expiry_days = 7
+            self.save_config()
+        self._submit_auth("restore", self._restore_session)
+
+    @property
+    def _cookie_path(self) -> Path:
+        return Path(self.data_dir) / "openms-session.bin"
+
+    def _restore_session(self):
+        client = self._client_for_request()
+        if not client.load_cookies(self._cookie_path):
+            return None
+        user = client.current_user()
+        if user is None:
+            client.delete_cookies(self._cookie_path)
+        else:
+            try:
+                client.save_cookies(self._cookie_path)
+            except OpenmsError as exc:
+                return user, str(exc)
+        return user
+
+    def on_shutdown(self):
+        self._stopping = True
+        if self._upload_timer is not None:
+            self._upload_timer.stop()
+            self._upload_timer = None
+        if self._poll_timer is not None:
+            self._poll_timer.stop()
+            self._poll_timer = None
+        if self._context_debounce is not None:
+            self._context_debounce.stop()
+            self._context_debounce = None
+        if self._context_poll_timer is not None:
+            self._context_poll_timer.stop()
+            self._context_poll_timer = None
+        self._epoch += 1
+        self._auth_epoch += 1
+        if self._future:
+            self._future.cancel()
+        if self._auth_future:
+            self._auth_future.cancel()
+        if self._executor:
+            # close 排在尚未完成的网络操作后，避免主线程等待或跨线程关闭 Session。
+            if self._http is not None:
+                self._executor.submit(self._http.close)
+            self._executor.shutdown(wait=False, cancel_futures=False)
+            self._executor = None
+        elif self._http is not None:
+            self._http.close()
+        self._http = None
+        self._login_user = None
+        self._captcha_key = ""
+        self._auth_busy = False
+        self._snapshot = self._selected = self._participant = None
+
+    def _ui(self, method: str, *args):
+        self.run_on_widget(lambda widget: getattr(widget, method)(*args))
+
+    def _client_for_request(self):
+        if self._http is None:
+            self._http = OpenmsClient(timeout=float(self.other_info.timeout_seconds))
+        self._http.timeout = float(self.other_info.timeout_seconds)
+        return self._http
+
+    def _submit_auth(self, kind: str, work: Callable):
+        if (self._stopping or self._executor is None or self._auth_busy
+                or self._future is not None):
+            if self._future is not None:
+                self._ui("set_auth_busy", False, "请等待当前比赛请求完成后再操作登录。")
+            return
+        self._auth_busy = True
+        self._auth_epoch += 1
+        epoch = self._auth_epoch
+        self._epoch += 1
+        if self._future:
+            self._future.cancel()
+        self._snapshot = self._selected = self._participant = None
+        self._analysis_target = None
+        self._ui("clear_analysis")
+        self._ui("clear_token")
+        self._ui("set_auth_busy", True, {
+            "captcha": "正在加载图片验证码…", "login": "正在登录…",
+            "check": "正在验证登录会话…", "logout": "正在退出登录…",
+            "restore": "正在恢复并验证登录会话…",
+            "save": "正在保存登录会话到系统凭据库…",
+        }[kind])
+        self._auth_future = self._executor.submit(work)
+
+        def done(future):
+            if future.cancelled() or self._stopping:
+                return
+            try:
+                result, error = future.result(), None
+            except Exception as exc:
+                result, error = None, exc
+            try:
+                self._auth_finished.emit(epoch, kind, result, error)
+            except RuntimeError:
+                pass
+
+        self._auth_future.add_done_callback(done)
+
+    @Slot()
+    def _refresh_captcha(self):
+        if self._stopping or self._auth_busy or self._login_user:
+            return
+        self._captcha_key = ""
+        self._ui("invalidate_captcha")
+        self._submit_auth("captcha", self._client_for_request().captcha)
+
+    @Slot(str, str, str)
+    def _login(self, username: str, password: str, captcha: str):
+        if self._stopping or self._auth_busy or self._login_user:
+            return
+        key, self._captcha_key = self._captcha_key, ""
+        self._ui("invalidate_captcha")
+        client = self._client_for_request()
+        expiry_days = self.other_info.login_expiry_days
+        self._save_username(username)
+
+        def login_and_store():
+            user = client.login(username, password, captcha, key, expiry_days=expiry_days)
+            try:
+                client.save_cookies(self._cookie_path)
+                return user, ""
+            except OpenmsError as exc:
+                return user, str(exc)
+
+        self._submit_auth("login", login_and_store)
+
+    @Slot()
+    def _check_login(self):
+        if self._stopping or self._auth_busy:
+            return
+        client = self._client_for_request()
+
+        def check_and_store():
+            user = client.current_user()
+            if user is None:
+                try:
+                    client.delete_cookies(self._cookie_path, strict=True)
+                except OpenmsError as exc:
+                    return None, str(exc)
+            else:
+                try:
+                    client.save_cookies(self._cookie_path)
+                except OpenmsError as exc:
+                    return user, str(exc)
+            return user, ""
+
+        self._submit_auth("check", check_and_store)
+
+    @Slot()
+    def _logout(self):
+        if self._stopping or self._auth_busy:
+            return
+        client = self._client_for_request()
+
+        def logout_and_forget():
+            try:
+                client.logout()
+            finally:
+                client.delete_cookies(self._cookie_path, strict=True)
+
+        self._submit_auth("logout", logout_and_forget)
+
+    @Slot(int)
+    def _check_in(self, tournament_id: int):
+        if (self._stopping or self._auth_busy or self._snapshot is None
+                or self._snapshot.user_id is None or self._login_user is None):
+            return
+        if self._future is not None:
+            self._ui("show_error", "当前请求尚未完成，请稍后再试。")
+            return
+        tournament = next((item for item in self._snapshot.tournaments if item.id == tournament_id), None)
+        if tournament is None or not tournament.is_ongoing():
+            self._ui("show_error", "该比赛已经结束或找不到，请刷新。")
+            return
+        if self._snapshot.participant_for(tournament_id) is not None or self._checkin_id is not None:
+            self._ui("show_error", "这场比赛已经打卡。")
+            return
+        self._selected = tournament
+        self._participant = None
+        self._checkin_id = tournament_id
+        self._ui("set_checkin_busy", tournament_id, True)
+        client = self._client_for_request()
+        user_id = self._snapshot.user_id
+        self._submit("checkin", lambda: client.check_in(tournament, user_id))
+
+    @Slot()
+    def _check_in_all(self):
+        if (self._stopping or self._auth_busy or self._snapshot is None
+                or self._snapshot.user_id is None or self._login_user is None):
+            self._ui("show_error", "请先登录 OpenMS 并刷新当前比赛。")
+            return
+        if self._checkin_all_busy or self._future is not None:
+            self._ui("show_error", "当前请求尚未完成，请稍后再试。")
+            return
+        candidates = tuple(
+            tournament for tournament in self._snapshot.tournaments
+            if tournament.is_ongoing() and self._snapshot.participant_for(tournament.id) is None
+        )
+        if not candidates:
+            self._ui("show_error", "当前没有尚未打卡且可参加的进行中比赛。")
+            return
+        user_id = self._snapshot.user_id
+        self._checkin_all_busy = True
+        self._ui("set_checkin_all_busy", True)
+        client = self._client_for_request()
+        self._submit("checkin_all", lambda: self._check_in_many(client, candidates, user_id))
+
+    @staticmethod
+    def _check_in_many(client: OpenmsClient, tournaments: tuple[Tournament, ...], user_id: int):
+        succeeded: list[tuple[Tournament, Participant]] = []
+        failed: list[tuple[Tournament, str]] = []
+        for index, tournament in enumerate(tournaments):
+            try:
+                participant = client.check_in(tournament, user_id)
+                if participant is None:
+                    failed.append((tournament, "OpenMS 未返回参赛记录。"))
+                else:
+                    succeeded.append((tournament, participant))
+            except RateLimitError as exc:
+                failed.append((tournament, str(exc)))
+                failed.extend((remaining, "因限流暂停后续打卡；冷却结束后可重新操作。")
+                              for remaining in tournaments[index + 1:])
+                break
+            except Exception as exc:
+                # POST 可能已生效，即使随后读取响应失败；查询一次，避免误报为未打卡。
+                try:
+                    participant = client.participant(tournament.id, user_id)
+                except Exception:
+                    participant = None
+                if participant is not None:
+                    succeeded.append((tournament, participant))
+                else:
+                    failed.append((tournament, str(exc) if isinstance(exc, OpenmsError)
+                                   else "请求失败，请稍后检查打卡状态。"))
+        return tuple(succeeded), tuple(failed)
+
+    @Slot(int, str, object, object)
+    def _on_auth_finished(self, epoch, kind, result, error):
+        if self._stopping or epoch != self._auth_epoch:
+            return
+        self._auth_busy = False
+        self._ui("set_auth_busy", False)
+        self._ui("set_busy", False)
+        if error is not None:
+            self.logger.warning(f"OpenMS authentication {kind}: {type(error).__name__}")
+            message = str(error) if isinstance(error, OpenmsError) else "登录服务请求失败，请稍后重试。"
+            if kind == "logout":
+                self._login_user = None
+                self._ui("show_login_user", None, "登录状态已在插件中清除；凭据库清理或服务器退出未确认，请检查系统凭据库和 OpenMS 网站。")
+            elif kind == "restore":
+                self._ui("show_login_user", None, f"登录会话恢复失败：{message}")
+                self._refresh()
+            else:
+                self._ui("set_auth_busy", False, message)
+            if kind == "login":
+                self._captcha_key = ""
+                self._ui("invalidate_captcha")
+            return
+        if kind == "captcha":
+            self._captcha_key = result.key
+            self._ui("show_captcha", result)
+            self._ui("set_auth_busy", False, "请输入图片验证码后登录；密码不会保存。")
+            return
+        persistence_warning = ""
+        if kind in ("login", "check", "restore") and isinstance(result, tuple) and len(result) == 2:
+            result, persistence_warning = result
+        if kind in ("login", "check", "restore"):
+            self._login_user = result
+        elif kind == "logout":
+            self._login_user = None
+        self._captcha_key = ""
+        if self._login_user and self.other_info.username != self._login_user.username:
+            self.other_info.username = self._login_user.username
+            self.save_config()
+        if persistence_warning:
+            self._ui("show_login_user", self._login_user, persistence_warning)
+        else:
+            self._ui("show_login_user", self._login_user)
+        if self._login_user:
+            if self.other_info.user_id != self._login_user.id:
+                self.other_info.user_id = self._login_user.id
+                self.save_config()
+                return  # config_changed 会刷新列表。
+        self._refresh()
+
+    def _submit(self, kind: str, work: Callable):
+        if self._stopping or self._executor is None or self._auth_busy:
+            return False
+        if self._future is not None:
+            return False
+        self._epoch += 1
+        epoch = self._epoch
+        self._network_kind = kind
+        self._ui("set_busy", True, {
+            "snapshot": "正在刷新比赛和打卡状态…",
+            "checkin": "正在向 OpenMS 提交打卡…",
+            "checkin_all": "正在逐场打卡；每场结果会分别确认…",
+            "upload": "正在上传比赛录像…",
+            "analysis": "正在读取我的比赛成绩…",
+        }.get(kind, "正在核对参赛信息…"))
+        self._future = self._executor.submit(work)
+
+        def done(future):
+            if future.cancelled() or self._stopping:
+                return
+            try:
+                result, error = future.result(), None
+            except Exception as exc:
+                result, error = None, exc
+            try:
+                self._finished.emit(epoch, kind, result, error)
+            except RuntimeError:
+                pass  # 宿主可能已经销毁插件 QObject。
+
+        self._future.add_done_callback(done)
+        return True
+
+    @Slot()
+    def _refresh(self):
+        if self._stopping or self._auth_busy:
+            return
+        if self._future is not None:
+            self._ui("set_busy", True, "当前 OpenMS 请求尚未完成，请稍后刷新。")
+            return
+        self._refresh_selection_id = self._selected.id if self._selected else None
+        self._participant = None
+        self._ui("clear_token", "正在刷新比赛和打卡状态…")
+        user_id = self._login_user.id if self._login_user else self.other_info.user_id
+        client = self._client_for_request()
+        self._submit("snapshot", lambda: client.snapshot(user_id))
+
+    @Slot(bool)
+    def _set_auto_manage_identifier(self, enabled: bool):
+        if self.other_info.auto_manage_identifier == enabled:
+            return
+        self.other_info.auto_manage_identifier = enabled
+        self.save_config()
+        if enabled:
+            self._ui("set_busy", False, "自动维护已开启；正在检查当前比赛标识。")
+            self._refresh_game_context()
+            self._on_poll_timeout()
+        else:
+            self._ui("set_busy", False, "自动维护已关闭；不会再后台修改比赛标识。")
+
+    @Slot(bool)
+    def _on_poll_timeout(self):
+        has_upload_records = self._uploads is not None and bool(self._uploads.records())
+        if (self._stopping or self._auth_busy
+                or not (self.other_info.auto_manage_identifier or self.other_info.auto_upload or has_upload_records)):
+            return
+        if self._future is not None:
+            return
+        self._refresh()
+        self._refresh_game_context()
+
+    @Slot(object)
+    def _on_game_status_change(self, _event):
+        self._schedule_context_refresh()
+
+    @Slot(int)
+    def _analyze_personal(self, tournament_id: int):
+        if self._stopping:
+            return
+        if self._login_user is None:
+            self._ui("show_analysis_error", "请先登录 OpenMS，只能分析当前登录账号的比赛成绩。")
+            return
+        if self._auth_busy or self._future is not None:
+            self._ui("show_analysis_error", "当前请求尚未完成，请稍后点击刷新我的成绩。")
+            return
+        tournament = next((item for item in self._snapshot.tournaments if item.id == tournament_id), None) if self._snapshot else None
+        if tournament is None or tournament.phase != "ongoing":
+            self._ui("clear_analysis")
+            self._ui("show_analysis_error", "该比赛已不在当前比赛范围内，请刷新比赛列表。")
+            return
+        user_id = self._login_user.id
+        self._analysis_target = (tournament_id, user_id)
+        self._ui("begin_analysis", tournament, user_id)
+        client = self._client_for_request()
+        if not self._submit("analysis", lambda: analyze_personal(
+                tournament, user_id, client.personal_videos(tournament_id, user_id))):
+            self._ui("show_analysis_error", "暂时无法开始查询，请稍后重试。")
+
+    @Slot(bool)
+    def _set_auto_upload(self, enabled: bool):
+        if self.other_info.auto_upload != enabled:
+            self.other_info.auto_upload = enabled
+            self.save_config()
+        if enabled:
+            self._refresh()
+
+    def _upload_tokens(self):
+        now = datetime.now(timezone.utc)
+        if (self._snapshot is None or self._login_user is None
+                or self._snapshot.user_id != self._login_user.id):
+            return {}
+        return {participant.token: (tournament, participant)
+                for tournament in self._snapshot.tournaments if tournament.is_ongoing(now)
+                if (participant := self._snapshot.participant_for(tournament.id)) is not None
+                and participant.user_id == self._login_user.id and participant.is_active(now)}
+
+    def _on_game_finished(self, event: GameFinishedEvent):
+        if (self._stopping or not self.other_info.auto_upload or self._login_user is None
+                or event.game_state != GameBoardState.Win.value or event.mode != 0
+                or not event.is_fair or not event.is_official or not event.raw_data):
+            return
+        available = self._upload_tokens()
+        tokens = tuple(dict.fromkeys(token.strip() for token in event.race_identifier.split(',')
+                                     if token.strip() in available))
+        if not tokens:
+            return
+        deadlines = []
+        for token in tokens:
+            tournament, participant = available[token]
+            limits = [value.timestamp() for value in (tournament.ends_at, participant.ends_at) if value is not None]
+            deadlines.append(min(limits) if limits else None)
+        deadline = None if None in deadlines else max(deadlines)
+        try:
+            if self._uploads is not None and self._uploads.enqueue(
+                    self._login_user.id, bytes(event.raw_data), tokens, deadline,
+                    tuple(dict.fromkeys(available[token][0].id for token in tokens))):
+                self._show_upload_records()
+                self._process_upload_queue()
+        except Exception:
+            self.logger.exception("Failed to save the OpenMS upload outbox")
+            self._ui("set_busy", False, "比赛录像无法加入上传队列，请检查插件数据目录和磁盘空间。")
+
+    @Slot()
+    def _show_upload_records(self):
+        if self._uploads is not None:
+            records = self._uploads.records()
+            if records != self._upload_record_cache:
+                self._upload_record_cache = records
+                self._ui("set_upload_records", records)
+
+    @Slot()
+    def _retry_uploads(self):
+        if self._uploads is not None and self._login_user is not None and self.other_info.auto_upload:
+            self._uploads.retry_failed(self._login_user.id)
+            self._process_upload_queue()
+            self._show_upload_records()
+
+    def _cleanup_uploads(self, snapshot: Snapshot | None = None):
+        if self._uploads is None:
+            return
+        self._uploads.purge_expired()
+        if snapshot is not None:
+            now = datetime.now(timezone.utc)
+            ids = {tournament.id for tournament in snapshot.tournaments
+                   if tournament.phase in ("ongoing", "preparing")
+                   and (tournament.ends_at is None or now < tournament.ends_at)}
+            token_tournaments = {participant.token: tournament_id
+                                 for tournament_id, participant in snapshot.participants
+                                 if participant is not None and participant.user_id == snapshot.user_id}
+            self._uploads.retain_tournaments(ids, user_id=snapshot.user_id,
+                                             token_tournaments=token_tournaments)
+        self._show_upload_records()
+
+    @Slot()
+    def _process_upload_queue(self):
+        if self._stopping:
+            return
+        # Cleanup is independent of upload consent, login state and network availability.
+        self._cleanup_uploads()
+        if (self._stopping or not self.other_info.auto_upload or self._login_user is None
+                or self._auth_busy or self._future is not None or self._executor is None
+                or self._uploads is None or monotonic() < self._upload_after or self._snapshot is None):
+            return
+        if self._snapshot.user_id != self._login_user.id:
+            return
+        if self._http is not None and self._http.cooldown_remaining() > 0:
+            return
+        job = self._uploads.next_job(self._login_user.id)
+        if job is None:
+            self._show_upload_records()
+            return
+        if not set(job.tokens).intersection(self._upload_tokens()):
+            self._uploads.discard(job)
+            self._show_upload_records()
+            return
+        self._upload_current = job
+        self._uploads.start(job)
+        client = self._client_for_request()
+        if not self._submit("upload", lambda: client.upload_video(job.raw_data, job.filename)):
+            self._uploads.fail(job, "等待当前请求完成", retryable=True)
+            self._upload_current = None
+        self._show_upload_records()
+
+    def _on_upload_finished(self, result, error):
+        job, self._upload_current = self._upload_current, None
+        self._upload_after = monotonic() + 1
+        if job is None or self._uploads is None:
+            return
+        if error is not None:
+            message = str(error) if isinstance(error, OpenmsError) else "上传请求失败，请稍后重试。"
+            needs_login = isinstance(error, UploadError) and error.needs_login
+            delay = error.retry_after if isinstance(error, UploadError) else None
+            if delay is not None:
+                self._upload_after = monotonic() + max(1, delay)
+            self._uploads.fail(job, message, retryable=isinstance(error, UploadError) and error.retryable,
+                               needs_login=needs_login, retry_after=delay,
+                               rate_limited=isinstance(error, UploadError) and error.rate_limited)
+            if needs_login:
+                self._login_user = None
+                self._snapshot = self._selected = self._participant = None
+                self._ui("show_login_user", None, message)
+                self._ui("clear_token")
+        elif result.status == "duplicate":
+            message = "网站已存在该录像，已从待上传队列移除，不再重试。"
+            self._uploads.finish(job, "duplicate", message)
+        else:
+            state_text = {"a": "待审核", "b": "已冻结", "c": "审核通过", "d": "玩家标识不匹配", "e": "外站审核"}
+            message = f"录像 #{result.video_id} 上传成功，网站状态：{state_text.get(result.state, result.state)}；比赛是否计分以网站为准。"
+            self._uploads.finish(job, "succeeded", message, video_id=result.video_id, state=result.state)
+        self._ui("set_busy", False, message)
+        self._cleanup_uploads()
+
+    def _schedule_context_refresh(self):
+        if self._context_debounce is not None and not self._stopping:
+            self._context_debounce.start()
+
+    @Slot()
+    def _on_context_debounce(self):
+        self._refresh_game_context()
+
+    def _refresh_game_context(self):
+        return self._read_game_context(auto_apply=True)
+
+    def _read_game_context(self, *, auto_apply: bool) -> GameContextResult | None:
+        if self._stopping:
+            return None
+        try:
+            result = self.query(GetGameContextQuery(), timeout=3.0)
+        except Exception as exc:
+            self.logger.debug(f"OpenMS host context query: {type(exc).__name__}")
+            result = None
+        if isinstance(result, GameContextResult) and result.success:
+            self._latest_game_context = result
+            self._ui("show_game_context", result)
+            if self._explicit_apply_all_pending:
+                if getattr(result, "game_status", "") == "ready":
+                    self._explicit_apply_all_pending = False
+                    self._apply_all_tokens()
+                else:
+                    self._ui("set_busy", False, "打卡已完成；待游戏结束并回到待开局状态后设置比赛标识。")
+            elif auto_apply and self.other_info.auto_manage_identifier:
+                self._auto_apply_from_snapshot(result)
+            return result
+        self._latest_game_context = None
+        self._ui("show_game_context", None)
+        return None
+
+    def _auto_apply_from_snapshot(self, context: GameContextResult | None = None):
+        if (self._stopping or not self.other_info.auto_manage_identifier
+                or self._snapshot is None or self._snapshot.user_id is None):
+            return
+        if self._future is not None:
+            return
+        context = context or self._latest_game_context
+        if context is None:
+            return
+        active = self._active_from_snapshot(self._snapshot)
+        if not active:
+            return  # 不清除用户手动设置的标识。
+        if not self.has_control_auth(SetRaceIdentifierCommand):
+            self._ui("set_authorized", False)
+            self._ui("set_busy", False, "比赛标识控制尚未授权，自动维护等待授权。")
+            return
+        if getattr(context, "game_status", "") != "ready":
+            self._ui("set_busy", False, "有效比赛标识已就绪；游戏结束并回到待开局状态后自动应用。")
+            return
+        target = ",".join(item.token for item in active)
+        current = str(getattr(context, "race_identifier", "") or "")
+        if current == target:
+            self._auto_retry_after = 0.0
+            return
+        if monotonic() < self._auto_retry_after:
+            return
+        self._auto_retry_after = monotonic() + 30.0
+        response = self.request(SetRaceIdentifierCommand(race_identifier=target))
+        if response is None:
+            self._ui("set_busy", False, "自动设置未收到响应，请检查主程序连接和控制授权。")
+        elif not response.success:
+            self._ui("set_busy", False, response.error or "自动设置比赛标识失败。")
+        else:
+            self._auto_retry_after = 0.0
+            self._ui("set_current_identifier", target)
+            self._ui("set_busy", False, f"已自动设置 {len(active)} 场当前有效比赛的标识。")
+
+    def _apply_all_tokens(self):
+        if (self._stopping or self._auth_busy or self._snapshot is None
+                or self._snapshot.user_id is None):
+            self._ui("show_error", "请先设置 OpenMS 用户 ID 并刷新比赛。")
+            return
+        if not self.has_control_auth(SetRaceIdentifierCommand):
+            self._ui("set_authorized", False)
+            self._ui("show_error", "请先在插件管理器中授权「设置比赛标识」。")
+            return
+        if self._future is not None:
+            self._ui("show_error", "当前请求尚未完成，请稍后再试。")
+            return
+        client = self._client_for_request()
+        self._submit("apply_all", lambda: client.active_participants(
+            self._snapshot.tournaments, self._snapshot.user_id))
+
+    @staticmethod
+    def _active_from_snapshot(snapshot: Snapshot) -> tuple[Participant, ...]:
+        now_active = []
+        for tournament in snapshot.tournaments:
+            participant = snapshot.participant_for(tournament.id)
+            if (participant is not None and tournament.is_ongoing()
+                    and participant.is_active()):
+                if "," in participant.token or any(character.isspace() for character in participant.token):
+                    continue
+                now_active.append(participant)
+        return tuple(now_active)
+
+    @Slot(int)
+    def _save_user_id(self, user_id: int):
+        if self._auth_busy or self._login_user:
+            return
+        if user_id == self.other_info.user_id:
+            self._refresh()
+            return
+        self.other_info.user_id = user_id
+        self.save_config()
+
+    @Slot(str)
+    def _save_username(self, username: str):
+        username = username.strip()
+        if username == self.other_info.username:
+            return
+        self.other_info.username = username
+        self.save_config()
+
+    @Slot(str, object)
+    def _config_changed(self, name: str, _value):
+        if name == "user_id":
+            self._analysis_target = None
+            self._ui("clear_analysis")
+            self._snapshot = self._selected = self._participant = None
+            self._ui("clear_token", "用户 ID 已更改，正在重新读取该账号的参赛状态。")
+            self._ui("set_user_id", self._login_user.id if self._login_user else self.other_info.user_id)
+        if name == "username":
+            self._ui("set_username", self.other_info.username)
+        if name == "auto_upload":
+            self._ui("set_auto_upload", self.other_info.auto_upload)
+            if self.other_info.auto_upload:
+                self._refresh()
+        if name == "auto_manage_identifier":
+            self._ui("set_auto_manage", self.other_info.auto_manage_identifier)
+            if self.other_info.auto_manage_identifier:
+                self._refresh_game_context()
+        if name == "login_expiry_days":
+            client = self._client_for_request()
+            if self.other_info.login_expiry_days < 7:
+                self.other_info.login_expiry_days = 7
+                self.save_config()
+            elif self._login_user:
+                self._ui("set_auth_busy", False, "保持登录时长将在下次登录时生效；请重新登录以更新会话有效期。")
+        if name in ("user_id", "timeout_seconds"):
+            self._refresh()
+
+    @Slot(int)
+    def _select_tournament(self, tournament_id: int):
+        if (self._stopping or self._auth_busy or self._snapshot is None
+                or self._future is not None):
+            return
+        self._selected = next((item for item in self._snapshot.tournaments if item.id == tournament_id), None)
+        self._participant = None
+        # 即便这次选择无需联网，也必须使上一次选择的后台结果失效。
+        self._epoch += 1
+        if self._future:
+            self._future.cancel()
+        if self._selected is None:
+            self._ui("show_error", "找不到该比赛，请刷新。")
+        elif not self._selected.is_ongoing():
+            self._ui("show_error", "该比赛尚未开始或已经结束，无法设置比赛标识。")
+        elif self._snapshot.user_id is None:
+            self._ui("show_error", "请填写并保存 OpenMS 用户 ID，以读取本人的参赛标识。")
+        else:
+            client = self._client_for_request()
+            user_id = self._snapshot.user_id
+            self._submit("participant", lambda: client.participant(tournament_id, user_id))
+
+    @Slot()
+    def _apply(self):
+        if self._stopping or self._auth_busy or self._future is not None:
+            return
+        if not self.has_control_auth(SetRaceIdentifierCommand):
+            self._ui("set_authorized", False)
+            self._ui("show_error", "请先在插件管理器中授权「设置比赛标识」。")
+            return
+        if not self._snapshot or not self._selected or not self._participant:
+            self._ui("show_error", "请先选中已报名的进行中比赛。")
+            return
+        if self._snapshot.user_id is None:
+            self._ui("show_error", "请填写并保存 OpenMS 用户 ID。")
+            return
+        if not self._selected.is_ongoing() or not self._participant.is_active():
+            self._ui("show_error", "当前不在有效参赛时间内，请刷新。")
+            return
+        # 应用前重新获取，避免把已过期或被更换的参赛标识写入下一局。
+        client = self._client_for_request()
+        tournaments, user_id = self._snapshot.tournaments, self._snapshot.user_id
+        self._submit("apply", lambda: client.active_participants(tournaments, user_id))
+
+    @Slot(int, str, object, object)
+    def _on_finished(self, epoch, kind, result, error):
+        if self._stopping:
+            return
+        if epoch == self._epoch:
+            self._future = None
+            self._network_kind = None
+        if epoch != self._epoch:
+            if kind == "checkin" and self._checkin_id is not None:
+                tournament_id, self._checkin_id = self._checkin_id, None
+                self._ui("set_checkin_busy", tournament_id, False)
+            return
+        if kind == "upload":
+            self._on_upload_finished(result, error)
+            return
+        if kind == "analysis":
+            self._ui("set_busy", False, "个人成绩读取失败，请在成绩窗口重试。" if error is not None else "我的成绩已更新。")
+            if self._login_user is None or self._analysis_target is None:
+                self._ui("clear_analysis")
+                return
+            if error is not None:
+                self._ui("show_analysis_error", str(error) if isinstance(error, OpenmsError)
+                         else "读取个人比赛成绩失败，请稍后重试。")
+            elif (result.tournament.id, result.user_id) == self._analysis_target and result.user_id == self._login_user.id:
+                self._ui("show_analysis", result)
+            else:
+                self._ui("clear_analysis")
+            return
+        if error is not None:
+            self._participant = None
+            self.logger.warning(f"OpenMS {kind}: {type(error).__name__}")
+            if kind == "checkin" and self._selected:
+                self._checkin_id = None
+                self._ui("set_checkin_busy", self._selected.id, False)
+            if kind == "checkin_all":
+                self._checkin_all_busy = False
+                self._ui("set_checkin_all_busy", False)
+            if kind == "snapshot" and self._poll_timer is not None:
+                self._poll_timer.setInterval(min(
+                    max(self._poll_timer.interval() * 2, self._auto_check_interval_ms),
+                    30 * 60 * 1000,
+                ))
+                if isinstance(error, RateLimitError):
+                    self._poll_timer.setInterval(max(self._poll_timer.interval(), int(error.retry_after * 1000) + 1000))
+            self._ui("show_error", str(error) if isinstance(error, OpenmsError) else "读取失败，请稍后刷新。")
+            return
+        if kind == "snapshot":
+            self._snapshot = result
+            self._cleanup_uploads(result)
+            if self._poll_timer is not None:
+                self._poll_timer.setInterval(self._auto_check_interval_ms)
+            self._ui("show_snapshot", result)
+            self._ui("set_authorized", self.has_control_auth(SetRaceIdentifierCommand))
+            selected_id = self._refresh_selection_id
+            self._refresh_selection_id = None
+            self._selected = next((item for item in result.tournaments if item.id == selected_id), None)
+            self._participant = result.participant_for(selected_id) if selected_id else None
+            if self._selected is not None:
+                self._ui("show_participant", self._selected, self._participant)
+            self._refresh_game_context()
+            return
+        if kind == "checkin":
+            self._checkin_id = None
+            if self._selected is None or result is None:
+                if self._selected:
+                    self._ui("set_checkin_busy", self._selected.id, False)
+                self._ui("show_error", "OpenMS 未返回打卡记录；请检查账号认证状态或刷新。")
+                return
+            participants = dict(self._snapshot.participants)
+            participants[self._selected.id] = result
+            self._snapshot = Snapshot(self._snapshot.tournaments, self._snapshot.user_id,
+                                      self._snapshot.fetched_at, tuple(participants.items()))
+            self._participant = result
+            self._ui("show_snapshot", self._snapshot)
+            self._ui("show_participant", self._selected, result)
+            self._ui("set_checkin_busy", self._selected.id, False)
+            self._ui("set_busy", False, "打卡成功，个人参赛计时已开始。")
+            self._refresh_game_context()
+            return
+        if kind == "checkin_all":
+            self._checkin_all_busy = False
+            self._ui("set_checkin_all_busy", False)
+            succeeded, failed = result
+            participants = dict(self._snapshot.participants)
+            for tournament, participant in succeeded:
+                participants[tournament.id] = participant
+            self._snapshot = Snapshot(
+                self._snapshot.tournaments, self._snapshot.user_id,
+                self._snapshot.fetched_at, tuple(participants.items()))
+            self._ui("show_snapshot", self._snapshot)
+            succeeded_text = "、".join(item.title for item, _ in succeeded) or "无"
+            failed_text = "；".join(f"{item.title}：{message}" for item, message in failed)
+            message = f"打卡完成：成功 {len(succeeded)} 场（{succeeded_text}），失败 {len(failed)} 场。"
+            if failed_text:
+                message += f"失败原因：{failed_text}"
+            self._ui("set_busy", False, message)
+            if succeeded:
+                self._explicit_apply_all_pending = True
+            self._refresh_game_context()
+            return
+        if kind == "participant":
+            self._participant = result
+            self._ui("show_participant", self._selected, result)
+            self._refresh_game_context()
+            return
+        if kind not in ("apply", "apply_all"):
+            return
+
+        active_participants = result
+        selected_participant = next(
+            (participant for participant in active_participants
+             if self._selected and participant.tournament_id == self._selected.id),
+            None,
+        )
+        active_ids = {tournament.id for tournament in self._snapshot.tournaments
+                      if tournament.is_ongoing()}
+        apply_all = kind == "apply_all"
+        if ((not apply_all and (not selected_participant or not selected_participant.is_active()
+                or not self._selected or not self._selected.is_ongoing()))
+                or any(participant.tournament_id not in active_ids or not participant.is_active()
+                       for participant in active_participants)
+                or not self.has_control_auth(SetRaceIdentifierCommand)):
+            self._ui("show_error", "参赛标识已不可用或控制授权已撤销，请刷新。")
+            return
+        participants_to_apply = active_participants
+        if not participants_to_apply:
+            self._ui("show_error", "没有可设置的有效参赛标识，请检查报名状态和参赛时间。")
+            return
+        self._participant = selected_participant
+        if self._selected is not None and selected_participant is not None:
+            self._ui("show_participant", self._selected, selected_participant)
+        race_identifier = ",".join(participant.token for participant in participants_to_apply)
+        context = self._read_game_context(auto_apply=False)
+        if context is None:
+            self._ui("show_error", "无法读取主程序状态，暂时不能确认是否可安全设置。")
+            return
+        if getattr(context, "game_status", "") != "ready":
+            self._ui("set_busy", False, "比赛标识已核对；请在游戏结束并回到待开局状态后设置。")
+            return
+        self._ui("set_busy", True, "正在设置比赛标识…")
+        response = self.request(SetRaceIdentifierCommand(race_identifier=race_identifier))
+        if response is None:
+            self._ui("set_busy", False, "设置未收到响应，请检查主程序连接和控制授权。")
+        elif not response.success:
+            self._ui("set_busy", False, response.error or "设置失败，请确认元扫雷处于待开局（ready）状态。")
+        else:
+            self._ui("set_current_identifier", race_identifier)
+            self._ui("set_busy", False,
+                     f"已设置 {len(participants_to_apply)} 场当前参赛比赛的标识（半角逗号分隔），可以开始下一局。")
+
+    def on_control_auth_changed(self, command_type: type, granted: bool):
+        if command_type is SetRaceIdentifierCommand:
+            self._ui("set_authorized", granted)
+            if granted and self.other_info.auto_manage_identifier:
+                self._refresh_game_context()

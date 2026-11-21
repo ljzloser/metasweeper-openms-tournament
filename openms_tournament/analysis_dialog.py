@@ -1,0 +1,210 @@
+"""Compact personal score summary and auditable scoring slots."""
+from __future__ import annotations
+from datetime import timedelta, timezone
+
+from PySide6.QtCore import QEvent, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QPalette
+from PySide6.QtWidgets import (
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QPushButton,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+)
+
+from .analysis import LEVEL_NAMES, STATE_NAMES, PersonalAnalysis
+from .client import Tournament
+
+
+class PersonalAnalysisDialog(QDialog):
+    refresh_requested = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('我的比赛成绩')
+        self.resize(900, 620)
+        self.tournament_id: int | None = None
+        self.user_id: int | None = None
+        layout = QVBoxLayout(self)
+        heading = QHBoxLayout()
+        self.heading_label = QLabel('请选择比赛')
+        self.heading_label.setWordWrap(True)
+        self.heading_label.setTextFormat(Qt.TextFormat.PlainText)
+        heading.addWidget(self.heading_label, 1)
+        self.refresh_button = QPushButton('刷新我的成绩')
+        self.refresh_button.clicked.connect(self._refresh)
+        self.refresh_button.setEnabled(False)
+        heading.addWidget(self.refresh_button)
+        layout.addLayout(heading)
+        self.total_label = QLabel()
+        # Keep the label's foreground from the active palette. A stylesheet on
+        # this label caused Qt to fall back to black text in some dark themes.
+        score_font = QFont(self.total_label.font())
+        score_font.setPixelSize(20)
+        score_font.setWeight(QFont.Weight.DemiBold)
+        self.total_label.setFont(score_font)
+        layout.addWidget(self.total_label)
+        self.rule_label = QLabel()
+        self.rule_label.setWordWrap(True)
+        layout.addWidget(self.rule_label)
+        self.count_label = QLabel()
+        self.count_label.setWordWrap(True)
+        layout.addWidget(self.count_label)
+        self.tabs = QTabWidget()
+        overview = QWidget()
+        overview_layout = QVBoxLayout(overview)
+        self.group_table = self._table(['难度', '计入 / 需求', '补位', '最好', '边界（含补位）', '小计'])
+        self.group_table.setMaximumHeight(145)
+        overview_layout.addWidget(self.group_table)
+        self.slot_table = self._table(['难度', '序号', '用时（秒）', 'IOE', '本局计分', '录像 / 补位'])
+        overview_layout.addWidget(self.slot_table, 1)
+        self.tabs.addTab(overview, '计分明细')
+        self.video_table = self._table(['录像 ID', '难度', '模式', '网站状态', '用时（秒）', '3BV', 'IOE', '计分', '计入情况 / 原因'])
+        self.tabs.addTab(self.video_table, '已提交录像')
+        reference_panel = QWidget()
+        reference_layout = QVBoxLayout(reference_panel)
+        reference_hint = QLabel('金羊杯参考统计：3BV/s、STNB 各自独立取最高的若干局，缺项按 0 补足；不参与官方用时总成绩。')
+        reference_hint.setWordWrap(True)
+        reference_layout.addWidget(reference_hint)
+        self.reference_table = self._table(['难度', '指标', '取用局数', '补位', '合计', '取用录像 ID'])
+        reference_layout.addWidget(self.reference_table)
+        self.tabs.addTab(reference_panel, '金羊杯参考指标')
+        self.tabs.setTabVisible(2, False)
+        layout.addWidget(self.tabs, 1)
+        self.status_label = QLabel('登录后可读取网站关联到自己的比赛录像。')
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.status_label)
+        self.slot_table.itemDoubleClicked.connect(self._open_video)
+        self.video_table.itemDoubleClicked.connect(self._open_video)
+        footer = QHBoxLayout()
+        footer.addWidget(QLabel('双击有录像 ID 的计分项或录像行，可打开网站录像。'))
+        footer.addStretch(1)
+        close_button = QPushButton('关闭')
+        close_button.clicked.connect(self.close)
+        footer.addWidget(close_button)
+        layout.addLayout(footer)
+        self._apply_theme_colors()
+
+    def changeEvent(self, event: QEvent):
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.PaletteChange, QEvent.Type.ApplicationPaletteChange):
+            self._apply_theme_colors()
+
+    def _apply_theme_colors(self):
+        if not hasattr(self, 'status_label'):
+            return
+        dark = self.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        if self.status_label.property('error'):
+            error_color = '#ff8a80' if dark else '#b42318'
+            self.status_label.setStyleSheet(f'color: {error_color}; font-weight: 600;')
+        else:
+            self.status_label.setStyleSheet('')
+
+    @staticmethod
+    def _table(headers: list[str]) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.verticalHeader().hide()
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(len(headers) - 1, QHeaderView.ResizeMode.Stretch)
+        return table
+
+    @staticmethod
+    def _fill(table: QTableWidget, rows: list[tuple[list[str], int | None]]):
+        table.setRowCount(len(rows))
+        for row, (values, video_id) in enumerate(rows):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                item.setData(Qt.ItemDataRole.UserRole, video_id)
+                table.setItem(row, column, item)
+
+    def clear(self):
+        self.tournament_id = self.user_id = None
+        for table in (self.group_table, self.slot_table, self.video_table, self.reference_table):
+            table.setRowCount(0)
+        for label in (self.total_label, self.rule_label, self.count_label):
+            label.clear()
+        self.heading_label.setText('请选择比赛')
+        self.status_label.setProperty('error', False)
+        self._apply_theme_colors()
+        self.status_label.setText('登录后可读取网站关联到自己的比赛录像。')
+        self.tabs.setTabVisible(2, False)
+        self.refresh_button.setEnabled(False)
+
+    def begin(self, tournament: Tournament, user_id: int):
+        self.clear()
+        self.tournament_id, self.user_id = tournament.id, user_id
+        self.heading_label.setText(f'{tournament.title} · OpenMS 用户 #{user_id}')
+        self.status_label.setProperty('error', False)
+        self._apply_theme_colors()
+        self.status_label.setText('正在读取网站已提交录像并计算个人成绩…')
+
+    def show_error(self, message: str):
+        for table in (self.group_table, self.slot_table, self.video_table, self.reference_table):
+            table.setRowCount(0)
+        for label in (self.total_label, self.rule_label, self.count_label):
+            label.clear()
+        self.status_label.setProperty('error', True)
+        self._apply_theme_colors()
+        self.status_label.setText(message)
+        self.refresh_button.setEnabled(self.tournament_id is not None)
+
+    def show_analysis(self, result: PersonalAnalysis):
+        if (self.tournament_id, self.user_id) != (result.tournament.id, result.user_id):
+            return
+        efficiency = result.tournament.subclass == 'e'
+        unit = '' if efficiency else ' 秒'
+        self.total_label.setText(f'当前{"效率总分" if efficiency else "总成绩"}：{result.total:.3f}{unit}')
+        rules = {
+            'w': '竞速周赛：取最快的 5 局中级和 2 局高级；中级须低于 60 秒，高级须低于 240 秒，缺项按上限补足。',
+            'e': '效率周赛：每局计分 = 用时（秒）÷ IOE²，IOE = 3BV ÷ 点击数。取中级最低 5 局、高级最低 2 局；缺项按 60 / 240 补足。计算使用原始精度。',
+            'g': '金羊杯：取最快的初级 20 局、中级 12 局、高级 5 局；3BV 下限为 10 / 30 / 100。缺项按 10 / 60 / 240 秒补足。',
+        }
+        self.rule_label.setText(rules[result.tournament.subclass] + ' 仅计入网站审核通过的标准模式录像。')
+        counted = sum(video.counted for video in result.videos)
+        required = sum(len(group.slots) for group in result.groups)
+        self.count_label.setText(f'网站已关联录像 {len(result.videos)} 局 · 计入 {counted} / {required} 局 · 补位 {required - counted} 项')
+        groups, slots = [], []
+        for group in result.groups:
+            groups.append(([LEVEL_NAMES[group.level], f'{group.selected_count} / {len(group.slots)}',
+                            str(len(group.slots) - group.selected_count), f'{group.slots[0].value:.3f}',
+                            f'{group.slots[-1].value:.3f}', f'{group.total:.3f}{unit}'], None))
+            for index, slot in enumerate(group.slots, 1):
+                video = slot.video
+                slots.append(([LEVEL_NAMES[group.level], str(index), f'{video.seconds:.3f}' if video else '—',
+                               f'{video.ioe:.3f}' if video and video.ioe is not None else '—',
+                               f'{slot.value:.3f}{unit}', f'#{video.id}' if video else '补位（规则上限）'], video.id if video else None))
+        self._fill(self.group_table, groups)
+        self.group_table.setFixedHeight(
+            self.group_table.horizontalHeader().height()
+            + sum(self.group_table.rowHeight(row) for row in range(self.group_table.rowCount()))
+            + 2 * self.group_table.frameWidth())
+        self._fill(self.slot_table, slots)
+        rows = []
+        for assessment in result.videos:
+            video = assessment.video
+            rows.append(([str(video.id), LEVEL_NAMES.get(video.level, video.level),
+                          '标准' if video.mode == '00' else video.mode, STATE_NAMES.get(video.state, video.state),
+                          f'{video.seconds:.3f}', str(video.bv), f'{video.ioe:.3f}' if video.ioe is not None else '—',
+                          f'{assessment.value:.3f}' if assessment.value is not None else '—', assessment.reason], video.id))
+        self._fill(self.video_table, rows)
+        self._fill(self.reference_table, [([LEVEL_NAMES[group.level], group.metric, str(len(group.values)),
+                                           str(group.missing), f'{group.total:.3f}',
+                                           ', '.join(f'#{video_id}' for video_id, _ in group.values)], None)
+                                         for group in result.references])
+        self.tabs.setTabVisible(2, bool(result.references))
+        self.status_label.setProperty('error', False)
+        self._apply_theme_colors()
+        self.status_label.setText(
+            f'基于网站已关联录像计算，非最终结算。未上传或尚未关联的本地录像不计入。读取时间：{result.fetched_at.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")}（北京时间）。')
+        self.refresh_button.setEnabled(True)
+
+    def _refresh(self):
+        if self.tournament_id is not None:
+            self.refresh_requested.emit(self.tournament_id)
+
+    def _open_video(self, item: QTableWidgetItem):
+        video_id = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(video_id, int) and video_id > 0:
+            QDesktopServices.openUrl(QUrl(f'https://openms.top/video/{video_id}'))
