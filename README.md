@@ -18,7 +18,7 @@ OpenAPI SDK，也不依赖「开源扫雷网」服务插件。插件加载、设
 安装插件附带的 `requirements.txt` 依赖。也可以在本仓库执行
 `python scripts/build_zip.py`，然后从插件管理器导入生成的 ZIP。
 
-本仓库已在本地初始化为独立 Git 仓库，未设置远程仓库。
+源代码托管于 [GitHub](https://github.com/ljzloser/metasweeper-openms-tournament)。
 
 ## 使用
 
