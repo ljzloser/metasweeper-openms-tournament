@@ -59,7 +59,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
     @classmethod
     def plugin_info(cls) -> PluginInfo:
         return PluginInfo(
-            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.4",
+            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.5",
             description="查看比赛、批量打卡、维护比赛标识、检查对局条件、上传录像并分析本人比赛成绩。",
             window_mode=WindowMode.TAB, other_info=TournamentConfig,
             icon=QIcon(str(Path(__file__).with_name("icon.svg"))),
@@ -96,6 +96,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         self._upload_current: UploadJob | None = None
         self._upload_after = 0.0
         self._upload_record_cache: list[dict] | None = None
+        self._manual_upload_available = False
         self._analysis_target: tuple[int, int] | None = None
         self._scores: dict[int, PersonalAnalysis] = {}
         self._replay_directory: TemporaryDirectory | None = None
@@ -135,6 +136,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         widget.analysis_requested.connect(self._analyze_personal)
         widget.replay_requested.connect(self._open_personal_replay)
         widget.show_login_user(self._login_user)
+        widget.set_manual_upload_available(self._manual_upload_available)
         widget.set_auth_busy(self._auth_busy)
         widget.set_authorized(self.has_control_auth(SetRaceIdentifierCommand))
         if self._uploads is not None:
@@ -158,6 +160,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         self._upload_current = None
         self._upload_after = 0.0
         self._upload_record_cache = None
+        self._manual_upload_available = False
         self._scores.clear()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openms-tournament")
         self._uploads = UploadQueue(Path(self.data_dir) / "uploads.sqlite3")
@@ -264,6 +267,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             self._future.cancel()
         self._snapshot = self._selected = self._participant = None
         self._analysis_target = None
+        self._set_manual_upload_available(False)
         self._scores.clear()
         self._ui("clear_analysis")
         self._ui("show_scores", ())
@@ -738,6 +742,8 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
                                 tournament, user_id, datetime.now(timezone.utc), (), (),
                                 website_error="网站成绩尚未读取，请刷新。")
                     self._publish_scores(update_dialog=self._network_kind not in ("analysis", "replay"))
+                    if not tokens:
+                        self._refresh_manual_upload_availability()
             if not tokens or raw is None:
                 return
             if self._enqueue_upload(user_id, raw, tokens, available, level=level, timems=timems,
@@ -770,6 +776,24 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             if records != self._upload_record_cache:
                 self._upload_record_cache = records
                 self._ui("set_upload_records", records)
+        self._refresh_manual_upload_availability()
+
+    def _set_manual_upload_available(self, available: bool):
+        if self._manual_upload_available != available:
+            self._manual_upload_available = available
+            self._ui("set_manual_upload_available", available)
+
+    def _refresh_manual_upload_availability(self):
+        user = self._login_user
+        queue = self._uploads
+        available = False
+        if user is not None and queue is not None and not self._auth_busy:
+            active_ids = {tournament.id for tournament, _ in self._upload_tokens().values()}
+            try:
+                available = bool(queue.manual_candidates(user.id, active_ids))
+            except SQLiteError:
+                pass
+        self._set_manual_upload_available(available)
 
     @Slot()
     def _show_manual_uploads(self):
@@ -781,6 +805,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         except SQLiteError:
             self._ui("set_busy", self._future is not None, "读取本地比赛录像失败，请稍后重试。")
             return
+        self._set_manual_upload_available(bool(rows))
         choices = []
         for row in rows:
             titles = "、".join(active[tournament_id] for tournament_id in row["tournament_ids"])

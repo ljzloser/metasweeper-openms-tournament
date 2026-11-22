@@ -222,6 +222,7 @@ class TournamentWidget(QWidget):
         self.manual_upload_button = icon_button("手动上传", "upload")
         self.manual_upload_button.setToolTip("选择插件已保存的比赛录像。关闭自动上传时也可使用。")
         self.manual_upload_button.clicked.connect(self.manual_upload_requested)
+        self.manual_upload_button.hide()
         options_row.addWidget(self.manual_upload_button)
         self.upload_history_button = icon_button("上传记录", "log")
         self.upload_history_button.clicked.connect(self._open_upload_history)
@@ -453,6 +454,7 @@ class TournamentWidget(QWidget):
         self._login_user = user
         if changed:
             self.show_scores(())
+            self.set_manual_upload_available(False)
         self.password_edit.clear()
         self.invalidate_captcha()
         if user:
@@ -501,6 +503,9 @@ class TournamentWidget(QWidget):
         self.upload_dialog.show()
         self.upload_dialog.raise_()
         self.upload_history_requested.emit()
+
+    def set_manual_upload_available(self, available: bool):
+        self.manual_upload_button.setVisible(available and self._login_user is not None)
 
     def choose_manual_upload(self, choices: list[tuple[str, tuple[str, ...]]]):
         if not choices:
