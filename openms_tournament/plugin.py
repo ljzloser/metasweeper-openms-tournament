@@ -59,7 +59,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
     @classmethod
     def plugin_info(cls) -> PluginInfo:
         return PluginInfo(
-            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.2",
+            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.3",
             description="查看比赛、批量打卡、维护比赛标识、检查对局条件、上传录像并分析本人比赛成绩。",
             window_mode=WindowMode.TAB, other_info=TournamentConfig,
             icon=QIcon(str(Path(__file__).with_name("icon.svg"))),
@@ -129,6 +129,8 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         widget.username_saved.connect(self._save_username)
         widget.auto_upload_changed.connect(self._set_auto_upload)
         widget.upload_history_requested.connect(self._show_upload_records)
+        widget.manual_upload_requested.connect(self._show_manual_uploads)
+        widget.manual_replay_selected.connect(self._queue_manual_upload)
         widget.retry_uploads_requested.connect(self._retry_uploads)
         widget.analysis_requested.connect(self._analyze_personal)
         widget.replay_requested.connect(self._open_personal_replay)
@@ -712,9 +714,9 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         local_matches = self._tournament_tokens(for_upload=False)
         tournaments = {local_matches[token][0].id: local_matches[token][0]
                        for token in identifiers if token in local_matches}
-        can_upload = (self.other_info.auto_upload and event.game_state == GameBoardState.Win.value
-                      and event.mode == 0 and event.is_fair and event.is_official and bool(event.raw_data))
-        available = self._upload_tokens() if can_upload else {}
+        uploadable = (event.game_state == GameBoardState.Win.value and event.mode == 0
+                      and event.is_fair and event.is_official and bool(event.raw_data))
+        available = self._upload_tokens() if self.other_info.auto_upload and uploadable else {}
         tokens = tuple(token for token in identifiers if token in available)
         raw = bytes(event.raw_data) if event.raw_data else None
         level = {3: "b", 4: "i", 5: "e"}.get(event.level)
@@ -729,7 +731,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
                 if self._uploads.record_win(
                         user_id, sha256(identity).hexdigest(), tuple(tournaments),
                         None if None in end_times else max(end_times), level, timems, event.bbbv, event.cl,
-                        None if tokens else raw):
+                        None if tokens else raw, uploadable=uploadable):
                     for tournament in tournaments.values():
                         if supports_scoring(tournament) and tournament.id not in self._scores:
                             self._scores[tournament.id] = PersonalAnalysis(
@@ -738,20 +740,28 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
                     self._publish_scores(update_dialog=self._network_kind not in ("analysis", "replay"))
             if not tokens or raw is None:
                 return
-            deadlines = []
-            for token in tokens:
-                tournament, participant = available[token]
-                limits = [value.timestamp() for value in (tournament.ends_at, participant.ends_at) if value is not None]
-                deadlines.append(min(limits) if limits else None)
-            if self._uploads.enqueue(
-                    user_id, raw, tokens, None if None in deadlines else max(deadlines),
-                    tuple(dict.fromkeys(available[token][0].id for token in tokens)),
-                    level=level, timems=timems, bv=event.bbbv, clicks=event.cl):
+            if self._enqueue_upload(user_id, raw, tokens, available, level=level, timems=timems,
+                                    bv=event.bbbv, clicks=event.cl):
                 self._show_upload_records()
                 self._process_upload_queue()
         except Exception:
             self.logger.exception("Failed to save the OpenMS upload outbox")
             self._ui("set_busy", False, "无法保存比赛对局，请检查插件数据目录和磁盘空间。")
+
+    def _enqueue_upload(self, user_id: int, raw: bytes, tokens: tuple[str, ...],
+                        available: dict[str, tuple[Tournament, Participant]], *, level: str | None,
+                        timems: int | None, bv: int, clicks: int | None, manual: bool = False) -> bool:
+        if self._uploads is None:
+            return False
+        deadlines = []
+        for token in tokens:
+            tournament, participant = available[token]
+            limits = [value.timestamp() for value in (tournament.ends_at, participant.ends_at) if value is not None]
+            deadlines.append(min(limits) if limits else None)
+        return self._uploads.enqueue(
+            user_id, raw, tokens, None if None in deadlines else max(deadlines),
+            tuple(dict.fromkeys(available[token][0].id for token in tokens)),
+            level=level, timems=timems, bv=bv, clicks=clicks, manual=manual)
 
     @Slot()
     def _show_upload_records(self):
@@ -762,8 +772,79 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
                 self._ui("set_upload_records", records)
 
     @Slot()
+    def _show_manual_uploads(self):
+        if self._stopping or self._auth_busy or self._uploads is None or self._login_user is None:
+            return
+        active = {tournament.id: tournament.title for tournament, _ in self._upload_tokens().values()}
+        try:
+            rows = self._uploads.manual_candidates(self._login_user.id, set(active))
+        except SQLiteError:
+            self._ui("set_busy", self._future is not None, "读取本地比赛录像失败，请稍后重试。")
+            return
+        choices = []
+        for row in rows:
+            titles = "、".join(active[tournament_id] for tournament_id in row["tournament_ids"])
+            level = LEVEL_NAMES.get(row["level"], "未知难度")
+            label = f"本地记录 #{row['rowid']} · {level} · {row['timems'] / 1000:.3f} 秒 · 3BV {row['bv']} · {titles}"
+            choices.append((row["digest"], label))
+        self._ui("choose_manual_upload", choices)
+
+    @Slot(str)
+    def _queue_manual_upload(self, digest: str):
+        if self._stopping or self._auth_busy or self._uploads is None or self._login_user is None:
+            return
+        user_id = self._login_user.id
+        available = self._upload_tokens()
+        try:
+            candidates = self._uploads.manual_candidates(
+                user_id, {tournament.id for tournament, _ in available.values()})
+            raw, _ = self._uploads.local_replay(user_id, digest)
+        except SQLiteError:
+            self._ui("set_busy", self._future is not None, "读取本地比赛录像失败，请稍后重试。")
+            return
+        selected = next((row for row in candidates if row["digest"] == digest), None)
+        if selected is None:
+            self._ui("set_busy", self._future is not None, "这份录像已入队、已上传或已超出参赛上传时间。")
+            return
+        if not raw:
+            self._ui("set_busy", self._future is not None, "这份录像的原始文件已不可用。")
+            return
+        try:
+            from ms_toollib import EvfVideo
+
+            replay = EvfVideo("manual-upload.evf", raw)
+            replay.parse()
+            uploadable = replay.is_completed and replay.mode == 0 and replay.is_fair and replay.is_official
+            identifiers = {identifier.strip() for identifier in replay.race_identifier.split(",")}
+        except Exception as exc:
+            self.logger.warning(f"OpenMS 手动上传无法读取 EVF: {type(exc).__name__}")
+            self._ui("set_busy", self._future is not None, "无法读取这份 EVF 录像。")
+            return
+        if not uploadable:
+            self._ui("set_busy", self._future is not None, "手动上传需要标准模式的正式公平胜局。")
+            return
+        available = self._upload_tokens()
+        tokens = tuple(token for token, (tournament, _) in available.items()
+                       if token in identifiers and tournament.id in selected["tournament_ids"])
+        if not tokens:
+            self._ui("set_busy", self._future is not None, "录像标识与当前有效参赛记录不匹配。")
+            return
+        try:
+            queued = self._enqueue_upload(user_id, raw, tokens, available, manual=True, level=selected["level"],
+                                          timems=selected["timems"], bv=selected["bv"], clicks=selected["clicks"])
+        except SQLiteError:
+            self._ui("set_busy", self._future is not None, "无法加入上传队列，请检查插件数据目录。")
+            return
+        if not queued:
+            self._ui("set_busy", self._future is not None, "这份录像已经在上传队列中或已上传。")
+            return
+        self._ui("set_busy", self._future is not None, "已加入手动上传队列。")
+        self._show_upload_records()
+        self._process_upload_queue()
+
+    @Slot()
     def _retry_uploads(self):
-        if self._uploads is not None and self._login_user is not None and self.other_info.auto_upload:
+        if self._uploads is not None and self._login_user is not None and not self._auth_busy:
             self._uploads.retry_failed(self._login_user.id)
             self._process_upload_queue()
             self._show_upload_records()
@@ -793,7 +874,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             return
         # Cleanup is independent of upload consent, login state and network availability.
         self._cleanup_uploads()
-        if (self._stopping or not self.other_info.auto_upload or self._login_user is None
+        if (self._stopping or self._login_user is None
                 or self._auth_busy or self._future is not None or self._executor is None
                 or self._uploads is None or monotonic() < self._upload_after or self._snapshot is None):
             return
@@ -801,7 +882,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             return
         if self._http is not None and self._http.cooldown_remaining() > 0:
             return
-        job = self._uploads.next_job(self._login_user.id)
+        job = self._uploads.next_job(self._login_user.id, include_auto=self.other_info.auto_upload)
         if job is None:
             self._show_upload_records()
             return

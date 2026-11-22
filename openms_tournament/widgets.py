@@ -3,17 +3,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QHideEvent, QPalette, QPixmap, QShowEvent
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QFont, QHideEvent, QPalette, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QInputDialog, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from .client import Captcha, LoginUser, Participant, Snapshot, Tournament
 from .analysis import PersonalAnalysis, supports_scoring
 from .analysis_dialog import PersonalAnalysisDialog
+from .ui_icons import icon_button, tournament_icon, ui_icon
 
 CHINA_TIME = timezone(timedelta(hours=8))
 ANALYSIS_COLUMN = 9
@@ -71,6 +72,8 @@ class TournamentWidget(QWidget):
     username_saved = Signal(str)
     auto_upload_changed = Signal(bool)
     upload_history_requested = Signal()
+    manual_upload_requested = Signal()
+    manual_replay_selected = Signal(str)
     retry_uploads_requested = Signal()
     analysis_requested = Signal(int)
     replay_requested = Signal(object)
@@ -96,15 +99,29 @@ class TournamentWidget(QWidget):
         self._checkin_all_busy = False
         self._condition_details: list[str] = []
         layout = QVBoxLayout(self)
+        layout.setSpacing(8)
         self._upload_notice = UploadNotice()
         layout.addWidget(self._upload_notice)
+        heading_row = QHBoxLayout()
+        heading_row.setSpacing(10)
+        mark = QLabel()
+        mark.setPixmap(tournament_icon().pixmap(QSize(34, 34), self.devicePixelRatioF()))
+        heading_row.addWidget(mark, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_block = QVBoxLayout()
+        title_block.setSpacing(2)
         title = QLabel("OpenMS 比赛")
         title_font = QFont(title.font())
         title_font.setPixelSize(22)
         title_font.setWeight(QFont.Weight.DemiBold)
         title.setFont(title_font)
-        layout.addWidget(title)
-        layout.addWidget(QLabel("查看比赛、个人打卡和比赛标识。时间均为北京时间（UTC+8）。"))
+        title_block.addWidget(title)
+        title_block.addWidget(QLabel("北京时间（UTC+8）"))
+        heading_row.addLayout(title_block)
+        heading_row.addStretch(1)
+        account_block = QVBoxLayout()
+        account_block.setSpacing(4)
+        heading_row.addLayout(account_block)
+        layout.addLayout(heading_row)
         self.condition_panel = QWidget(self)
         self.condition_row = QHBoxLayout(self.condition_panel)
         self.condition_row.setContentsMargins(0, 0, 0, 0)
@@ -118,6 +135,7 @@ class TournamentWidget(QWidget):
         layout.addWidget(self.condition_panel)
         self.login_dialog = QDialog(self)
         self.login_dialog.setWindowTitle("登录 OpenMS")
+        self.login_dialog.setWindowIcon(tournament_icon())
         self.login_dialog.setModal(True)
         login_dialog_layout = QVBoxLayout(self.login_dialog)
         login_dialog_layout.addWidget(QLabel("使用 OpenMS 账号登录。密码仅用于本次登录，不会保存。"))
@@ -141,17 +159,17 @@ class TournamentWidget(QWidget):
         self.captcha_edit.setMaxLength(6)
         self.captcha_edit.setMaximumWidth(100)
         captcha_row.addWidget(self.captcha_edit)
-        self.captcha_button = QPushButton("刷新验证码")
+        self.captcha_button = icon_button("刷新验证码", "refresh")
         self.captcha_button.clicked.connect(self.captcha_requested)
         captcha_row.addWidget(self.captcha_button)
         captcha_row.addStretch(1)
         login_dialog_layout.addLayout(captcha_row)
         dialog_buttons = QHBoxLayout()
         dialog_buttons.addStretch(1)
-        self.login_button = QPushButton("登录")
+        self.login_button = icon_button("登录", "authorize")
         self.login_button.clicked.connect(self._login)
         dialog_buttons.addWidget(self.login_button)
-        self.cancel_login_button = QPushButton("取消")
+        self.cancel_login_button = icon_button("取消", "cancel")
         self.cancel_login_button.clicked.connect(self.login_dialog.reject)
         dialog_buttons.addWidget(self.cancel_login_button)
         login_dialog_layout.addLayout(dialog_buttons)
@@ -159,24 +177,20 @@ class TournamentWidget(QWidget):
         self.auth_label = QLabel("未登录 · 可填写用户 ID 匿名浏览；不会保存密码。")
         self.auth_label.setTextFormat(Qt.TextFormat.PlainText)
         self.auth_label.setWordWrap(True)
-        auth_row.addWidget(self.auth_label, 1)
-        self.refresh_button = QPushButton("刷新比赛")
-        self.refresh_button.clicked.connect(self.refresh_requested)
-        auth_row.addWidget(self.refresh_button)
-        self.check_in_all_button = QPushButton("一键打卡所有可参加比赛")
-        self.check_in_all_button.setToolTip("需要登录 OpenMS；会逐场处理所有未打卡的进行中比赛。")
-        self.check_in_all_button.clicked.connect(self._confirm_check_in_all)
-        auth_row.addWidget(self.check_in_all_button)
-        self.open_login_button = QPushButton("登录 OpenMS")
+        self.auth_label.setMinimumWidth(245)
+        self.auth_label.setMaximumWidth(360)
+        account_block.addWidget(self.auth_label)
+        self.open_login_button = icon_button("登录 OpenMS", "authorize")
         self.open_login_button.clicked.connect(self._open_login_dialog)
         auth_row.addWidget(self.open_login_button)
-        self.login_check_button = QPushButton("检查登录状态")
+        self.login_check_button = icon_button("检查登录状态", "refresh")
         self.login_check_button.clicked.connect(self.login_check_requested)
         auth_row.addWidget(self.login_check_button)
-        self.logout_button = QPushButton("退出登录")
+        self.logout_button = icon_button("退出登录", "window-close")
         self.logout_button.clicked.connect(self.logout_requested)
         auth_row.addWidget(self.logout_button)
-        layout.addLayout(auth_row)
+        auth_row.addStretch(1)
+        account_block.addLayout(auth_row)
         self.identity_panel = QWidget(self)
         identity_row = QHBoxLayout(self.identity_panel)
         identity_row.setContentsMargins(0, 0, 0, 0)
@@ -187,34 +201,54 @@ class TournamentWidget(QWidget):
         self.user_id_edit.setSpecialValueText("未配置")
         self.user_id_edit.setValue(user_id)
         self.user_id_edit.setToolTip("填写 OpenMS 个人主页对应的数字用户 ID；0 表示未配置。")
-        identity_row.addWidget(self.user_id_edit, 1)
-        self.save_button = QPushButton("保存并刷新")
+        identity_row.addWidget(self.user_id_edit)
+        self.save_button = icon_button("保存并刷新", "confirm")
         self.save_button.clicked.connect(lambda: self.user_id_saved.emit(self.user_id_edit.value()))
         identity_row.addWidget(self.save_button)
+        identity_row.addStretch(1)
         layout.addWidget(self.identity_panel)
-        options_row = QHBoxLayout()
-        self.auto_manage_checkbox = QCheckBox("自动维护比赛标识（每 5 分钟检查）")
+        toolbar = QFrame()
+        toolbar.setFrameShape(QFrame.Shape.StyledPanel)
+        options_row = QHBoxLayout(toolbar)
+        options_row.setContentsMargins(8, 4, 8, 4)
+        options_row.setSpacing(8)
+        self.refresh_button = icon_button("刷新比赛", "refresh")
+        self.refresh_button.clicked.connect(self.refresh_requested)
+        options_row.addWidget(self.refresh_button)
+        self.check_in_all_button = icon_button("一键打卡", "confirm")
+        self.check_in_all_button.setToolTip("登录后逐场打卡所有可参加的进行中比赛。")
+        self.check_in_all_button.clicked.connect(self._confirm_check_in_all)
+        options_row.addWidget(self.check_in_all_button)
+        self.manual_upload_button = icon_button("手动上传", "upload")
+        self.manual_upload_button.setToolTip("选择插件已保存的比赛录像。关闭自动上传时也可使用。")
+        self.manual_upload_button.clicked.connect(self.manual_upload_requested)
+        options_row.addWidget(self.manual_upload_button)
+        self.upload_history_button = icon_button("上传记录", "log")
+        self.upload_history_button.clicked.connect(self._open_upload_history)
+        options_row.addWidget(self.upload_history_button)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.VLine)
+        options_row.addWidget(divider)
+        self.auto_manage_checkbox = QCheckBox("自动维护比赛标识")
         self.auto_manage_checkbox.setToolTip(
             "每 5 分钟检查一次已打卡比赛；回到待开局状态时也会检查并应用有效标识。")
         self.auto_manage_checkbox.setChecked(auto_manage)
         self.auto_manage_checkbox.toggled.connect(self.auto_manage_changed)
         options_row.addWidget(self.auto_manage_checkbox)
-        self.auto_upload_checkbox = QCheckBox("自动上传比赛录像")
+        self.auto_upload_checkbox = QCheckBox("自动上传录像")
         self.auto_upload_checkbox.setChecked(auto_upload)
         self.auto_upload_checkbox.setToolTip("上传开启后完成的公平正式标准模式比赛胜局；重复录像自动从队列移除。")
         self.auto_upload_checkbox.toggled.connect(self.auto_upload_changed)
         self.auto_upload_checkbox.toggled.connect(self._update_actions)
         options_row.addWidget(self.auto_upload_checkbox)
         options_row.addStretch(1)
-        self.upload_history_button = QPushButton("上传记录")
-        self.upload_history_button.clicked.connect(self._open_upload_history)
+        layout.addWidget(toolbar)
         self.analysis_dialog = PersonalAnalysisDialog(self)
         self.analysis_dialog.refresh_requested.connect(self.analysis_requested)
         self.analysis_dialog.replay_requested.connect(self.replay_requested)
-        options_row.addWidget(self.upload_history_button)
-        layout.addLayout(options_row)
         self.upload_dialog = QDialog(self)
         self.upload_dialog.setWindowTitle("比赛录像上传记录")
+        self.upload_dialog.setWindowIcon(ui_icon("upload"))
         self.upload_dialog.resize(880, 420)
         upload_layout = QVBoxLayout(self.upload_dialog)
         upload_hint = QLabel(
@@ -230,18 +264,15 @@ class TournamentWidget(QWidget):
         self.upload_table.verticalHeader().hide()
         self.upload_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.upload_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        self.upload_table.itemSelectionChanged.connect(self._update_upload_open_button)
+        self.upload_table.setAlternatingRowColors(True)
         upload_layout.addWidget(self.upload_table, 1)
         upload_buttons = QHBoxLayout()
-        self.retry_uploads_button = QPushButton("重试当前账号失败项")
+        self.retry_uploads_button = icon_button("重试失败项", "refresh")
+        self.retry_uploads_button.setToolTip("重试当前登录账号上传失败的录像。")
         self.retry_uploads_button.clicked.connect(self.retry_uploads_requested)
         upload_buttons.addWidget(self.retry_uploads_button)
-        self.open_uploaded_video_button = QPushButton("打开网站录像")
-        self.open_uploaded_video_button.setEnabled(False)
-        self.open_uploaded_video_button.clicked.connect(self._open_uploaded_video)
-        upload_buttons.addWidget(self.open_uploaded_video_button)
         upload_buttons.addStretch(1)
-        close_uploads_button = QPushButton("关闭")
+        close_uploads_button = icon_button("关闭", "close")
         close_uploads_button.clicked.connect(self.upload_dialog.close)
         upload_buttons.addWidget(close_uploads_button)
         upload_layout.addLayout(upload_buttons)
@@ -251,10 +282,12 @@ class TournamentWidget(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().hide()
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().resizeSection(2, 112)
         self.table.itemSelectionChanged.connect(self._select)
         self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
         layout.addWidget(self.table, 1)
@@ -266,13 +299,14 @@ class TournamentWidget(QWidget):
         token_row.addWidget(QLabel("当前总比赛标识"))
         self.current_identifier_edit = QLineEdit()
         self.current_identifier_edit.setReadOnly(True)
+        self.current_identifier_edit.addAction(ui_icon("tag"), QLineEdit.ActionPosition.LeadingPosition)
         self.current_identifier_edit.setPlaceholderText("读取主程序当前设置")
         self.current_identifier_edit.setText("等待读取主程序标识")
         token_row.addWidget(self.current_identifier_edit, 1)
-        self.copy_button = QPushButton("复制总标识")
+        self.copy_button = icon_button("复制总标识", "copy")
         self.copy_button.clicked.connect(self._copy)
         token_row.addWidget(self.copy_button)
-        self.apply_button = QPushButton("设置到元扫雷")
+        self.apply_button = icon_button("设置到元扫雷", "settings")
         self.apply_button.setToolTip(
             "重新核对所有当前有效参赛比赛，并将各场比赛标识用英文半角逗号连接（不加空格）后设置。")
         self.apply_button.clicked.connect(self.apply_requested)
@@ -335,8 +369,8 @@ class TournamentWidget(QWidget):
             and not self._busy and not self._auth_busy and not self._checkin_all_busy)
         self.auto_manage_checkbox.setEnabled(not self._auth_busy)
         self.auto_upload_checkbox.setEnabled(not self._auth_busy)
-        self.retry_uploads_button.setEnabled(
-            logged_in and self.auto_upload_checkbox.isChecked() and not self._auth_busy and not self._busy)
+        self.manual_upload_button.setEnabled(logged_in and not self._auth_busy and not self._busy)
+        self.retry_uploads_button.setEnabled(logged_in and not self._auth_busy and not self._busy)
         self.table.setEnabled(not self._busy and not self._auth_busy)
         for edit in (self.username_edit, self.password_edit, self.captcha_edit):
             edit.setEnabled(not logged_in and not self._auth_busy)
@@ -468,6 +502,25 @@ class TournamentWidget(QWidget):
         self.upload_dialog.raise_()
         self.upload_history_requested.emit()
 
+    def choose_manual_upload(self, choices: list[tuple[str, str]]):
+        if not choices:
+            QMessageBox.information(self, "手动上传", "当前没有可手动上传的本地比赛录像。"
+                                    "需要已打卡且仍在个人上传时间内的正式公平标准模式胜局。")
+            return
+        labels = {label: digest for digest, label in choices}
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("手动上传比赛录像")
+        dialog.setWindowIcon(ui_icon("upload"))
+        dialog.setLabelText("选择要提交到 OpenMS 的本地比赛录像：")
+        dialog.setComboBoxItems(list(labels))
+        dialog.setOkButtonText("加入上传队列")
+        dialog.setCancelButtonText("取消")
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            digest = labels.get(dialog.textValue())
+            if digest is not None:
+                self.manual_replay_selected.emit(digest)
+        dialog.deleteLater()
+
     @property
     def upload_notice_message(self) -> str:
         return self._upload_notice.text()
@@ -557,16 +610,6 @@ class TournamentWidget(QWidget):
                 self.upload_table.setItem(row, column, item)
             if record["filename"] == selected_id:
                 self.upload_table.selectRow(row)
-        self._update_upload_open_button()
-
-    def _update_upload_open_button(self):
-        item = self.upload_table.item(self.upload_table.currentRow(), 4)
-        self.open_uploaded_video_button.setEnabled(bool(item and item.text().isascii() and item.text().isdigit()))
-
-    def _open_uploaded_video(self):
-        item = self.upload_table.item(self.upload_table.currentRow(), 4)
-        if item and item.text().isascii() and item.text().isdigit():
-            QDesktopServices.openUrl(QUrl("https://openms.top/video/" + item.text()))
 
     def show_game_context(self, context):
         if context is None or not getattr(context, "success", False):
@@ -677,12 +720,12 @@ class TournamentWidget(QWidget):
                     item = QTableWidgetItem(text)
                     item.setData(Qt.ItemDataRole.UserRole, tournament.id)
                     self.table.setItem(row, column, item)
-                analysis_button = QPushButton("我的成绩")
+                analysis_button = icon_button("我的成绩", "score")
                 analysis_button.clicked.connect(lambda _checked=False, item_id=tournament.id: self._open_analysis(item_id))
                 self.table.setCellWidget(row, ANALYSIS_COLUMN, analysis_button)
                 token_item = self.table.item(row, 2)
                 if attendance is not None and attendance.token:
-                    token_item.setToolTip("双击复制比赛标识。")
+                    token_item.setToolTip(f"比赛标识：{attendance.token}\n双击复制。")
                 elif attendance is not None:
                     token_item.setToolTip("比赛标识会在个人参赛时间开始后公开。")
                 cell = QWidget(self.table)
@@ -694,7 +737,7 @@ class TournamentWidget(QWidget):
                 status = QLabel(status_text)
                 status.setObjectName("attendanceStatus")
                 cell_layout.addWidget(status)
-                checkin = QPushButton("开始打卡")
+                checkin = icon_button("打卡", "confirm")
                 checkin.setObjectName("checkInButton")
                 checkin.setProperty("tournament_id", tournament.id)
                 checkin.setVisible(can_check_in and attendance is None)
@@ -730,7 +773,7 @@ class TournamentWidget(QWidget):
                 if token_item is not None:
                     token_item.setText(self._participant_token_text(participant))
                     token_item.setToolTip(
-                        "双击复制比赛标识。" if participant.token
+                        f"比赛标识：{participant.token}\n双击复制。" if participant.token
                         else "比赛标识会在个人参赛时间开始后公开。")
             self._can_apply = tournament.is_ongoing() and participant.is_active()
             window = f"个人参赛时间：{format_time(participant.starts_at)} 至 {format_time(participant.ends_at)}"
@@ -770,7 +813,7 @@ class TournamentWidget(QWidget):
         if token_item is not None:
             token_item.setText(self._participant_token_text(participant))
             token_item.setToolTip(
-                "双击复制比赛标识。" if participant and participant.token
+                f"比赛标识：{participant.token}\n双击复制。" if participant and participant.token
                 else "比赛标识会在个人参赛时间开始后公开。" if participant else "")
         cell = self.table.cellWidget(row, 3)
         if cell is None:

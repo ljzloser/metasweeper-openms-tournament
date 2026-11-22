@@ -46,13 +46,16 @@ class UploadQueue:
             columns = {row['name'] for row in database.execute('PRAGMA table_info(uploads)')}
             if 'tournament_ids' not in columns:
                 database.execute("ALTER TABLE uploads ADD COLUMN tournament_ids TEXT NOT NULL DEFAULT '[]'")
-            for column, kind in (('level', 'TEXT'), ('timems', 'INTEGER'), ('bv', 'INTEGER'), ('clicks', 'INTEGER')):
+            for column, kind in (('level', 'TEXT'), ('timems', 'INTEGER'), ('bv', 'INTEGER'), ('clicks', 'INTEGER'),
+                                 ('manual', 'INTEGER NOT NULL DEFAULT 0')):
                 if column not in columns:
                     database.execute(f"ALTER TABLE uploads ADD COLUMN {column} {kind}")
             database.execute("""CREATE TABLE IF NOT EXISTS local_wins (
                 digest TEXT NOT NULL, user_id INTEGER NOT NULL, tournament_ids TEXT NOT NULL, deadline REAL,
                 level TEXT NOT NULL, timems INTEGER NOT NULL, bv INTEGER NOT NULL, clicks INTEGER,
                 raw_data BLOB, video_id INTEGER, PRIMARY KEY (digest, user_id))""")
+            if not any(row['name'] == 'uploadable' for row in database.execute('PRAGMA table_info(local_wins)')):
+                database.execute("ALTER TABLE local_wins ADD COLUMN uploadable INTEGER")
             database.execute("""INSERT OR IGNORE INTO local_wins
                 (digest,user_id,tournament_ids,level,timems,bv,clicks,video_id)
                 SELECT digest,user_id,tournament_ids,COALESCE(level,''),
@@ -77,28 +80,63 @@ class UploadQueue:
 
     def enqueue(self, user_id: int, raw_data: bytes, tokens: tuple[str, ...], deadline: float | None,
                 tournament_ids: tuple[int, ...] = (), *, level: str | None = None, timems: int | None = None,
-                bv: int | None = None, clicks: int | None = None) -> bool:
+                bv: int | None = None, clicks: int | None = None, manual: bool = False) -> bool:
         digest = hashlib.sha256(raw_data).hexdigest()
         now = time.time()
         filename = datetime.fromtimestamp(now, timezone.utc).strftime('%Y%m%d-%H%M%S-') + digest[:12] + '.evf'
         with self._connect() as database:
             cursor = database.execute("""INSERT OR IGNORE INTO uploads
-                (digest,user_id,filename,tokens,deadline,created,raw_data,tournament_ids,level,timems,bv,clicks)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (digest,user_id,filename,tokens,deadline,created,raw_data,tournament_ids,level,timems,bv,clicks,manual)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (digest, user_id, filename, json.dumps(tokens), deadline, now, raw_data, json.dumps(tournament_ids),
-                 level, timems, bv, clicks))
-            return cursor.rowcount == 1
+                 level, timems, bv, clicks, manual))
+            queued = cursor.rowcount == 1
+            if manual and not queued:
+                cursor = database.execute("""UPDATE uploads SET manual=1,tokens=?,deadline=?,tournament_ids=?,
+                    retry_after=CASE WHEN status='failed' THEN 0 ELSE retry_after END,
+                    attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,
+                    message=CASE WHEN status='failed' THEN '等待重试' ELSE message END,
+                    status=CASE WHEN status='failed' THEN 'pending' ELSE status END
+                    WHERE digest=? AND user_id=? AND raw_data IS NOT NULL
+                    AND (status='failed' OR (status IN ('pending','retry') AND manual=0))""",
+                    (json.dumps(tokens), deadline, json.dumps(tournament_ids), digest, user_id))
+                queued = cursor.rowcount == 1
+            if manual and queued:
+                database.execute("UPDATE local_wins SET raw_data=NULL WHERE digest=? AND user_id=?", (digest, user_id))
+            return queued
 
     def record_win(self, user_id: int, digest: str, tournament_ids: tuple[int, ...],
                    deadline: float | None, level: str, timems: int, bv: int, clicks: int,
-                   raw_data: bytes | None) -> bool:
+                   raw_data: bytes | None, *, uploadable: bool | None = None) -> bool:
         with self._connect() as database:
             cursor = database.execute("""INSERT OR IGNORE INTO local_wins
-                (digest,user_id,tournament_ids,deadline,level,timems,bv,clicks,raw_data,video_id)
-                VALUES (?,?,?,?,?,?,?,?,?,(SELECT video_id FROM uploads WHERE digest=? AND user_id=?))""",
+                (digest,user_id,tournament_ids,deadline,level,timems,bv,clicks,raw_data,uploadable,video_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,(SELECT video_id FROM uploads WHERE digest=? AND user_id=?))""",
                 (digest, user_id, json.dumps(tournament_ids), deadline, level, timems, bv, clicks, raw_data,
-                 digest, user_id))
+                 uploadable, digest, user_id))
             return cursor.rowcount == 1
+
+    def manual_candidates(self, user_id: int, active_ids: set[int]) -> list[dict]:
+        if not active_ids:
+            return []
+        now = time.time()
+        with self._connect() as database:
+            rows = database.execute("""SELECT l.rowid,l.digest,l.tournament_ids,l.level,l.timems,l.bv,l.clicks
+                FROM local_wins AS l LEFT JOIN uploads AS u USING (user_id,digest)
+                WHERE l.user_id=? AND l.video_id IS NULL AND (l.deadline IS NULL OR l.deadline>?)
+                  AND COALESCE(l.uploadable,1)=1
+                  AND ((u.status IS NULL AND l.raw_data IS NOT NULL)
+                    OR (u.raw_data IS NOT NULL AND (u.deadline IS NULL OR u.deadline>?)
+                      AND (u.status='failed' OR (u.status IN ('pending','retry') AND u.manual=0))))
+                ORDER BY l.rowid DESC""", (user_id, now, now)).fetchall()
+        candidates = []
+        for row in rows:
+            matches = active_ids.intersection(json.loads(row['tournament_ids']))
+            if matches:
+                item = dict(row)
+                item['tournament_ids'] = sorted(matches)
+                candidates.append(item)
+        return candidates
 
     def score_videos(self, user_id: int, tournament_id: int) -> tuple[ScoreVideo, ...]:
         with self._connect() as database:
@@ -174,13 +212,13 @@ class UploadQueue:
         with self._connect() as database:
             database.execute('DELETE FROM uploads WHERE digest=? AND user_id=?', (job.digest, job.user_id))
 
-    def next_job(self, user_id: int, now: float | None = None) -> UploadJob | None:
+    def next_job(self, user_id: int, now: float | None = None, *, include_auto: bool = True) -> UploadJob | None:
         now = time.time() if now is None else now
         self.purge_expired(now)
         with self._connect() as database:
             row = database.execute("""SELECT * FROM uploads WHERE user_id=? AND status IN ('pending','retry')
-                AND retry_after<=? AND raw_data IS NOT NULL
-                ORDER BY COALESCE(deadline, 1e30), created LIMIT 1""", (user_id, now)).fetchone()
+                AND retry_after<=? AND raw_data IS NOT NULL AND (? OR manual=1)
+                ORDER BY COALESCE(deadline, 1e30), created LIMIT 1""", (user_id, now, include_auto)).fetchone()
         if row is None:
             return None
         return UploadJob(row['digest'], row['user_id'], row['filename'], tuple(json.loads(row['tokens'])),
@@ -214,7 +252,7 @@ class UploadQueue:
 
     def retry_failed(self, user_id: int):
         with self._connect() as database:
-            database.execute("""UPDATE uploads SET status='pending', attempts=0, retry_after=0, message='等待重试'
+            database.execute("""UPDATE uploads SET status='pending', attempts=0, retry_after=0, message='等待重试', manual=1
                 WHERE user_id=? AND status='failed' AND raw_data IS NOT NULL""", (user_id,))
 
     def records(self) -> list[dict]:

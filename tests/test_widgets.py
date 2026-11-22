@@ -59,9 +59,7 @@ def test_authorization_status_is_explicit_and_updates_live(qtbot):
     assert not widget.condition_panel.isHidden()
 
 
-def test_upload_history_distinguishes_duplicate_and_success_and_retries_only_when_enabled(qtbot, monkeypatch):
-    from PySide6.QtGui import QDesktopServices
-
+def test_upload_history_distinguishes_duplicate_and_success_and_retries_when_logged_in(qtbot):
     widget = TournamentWidget()
     qtbot.addWidget(widget)
     assert not widget.auto_upload_checkbox.isChecked()
@@ -69,7 +67,7 @@ def test_upload_history_distinguishes_duplicate_and_success_and_retries_only_whe
     widget.show_login_user(LoginUser(7, "tester"))
     widget.set_auto_upload(True)
     assert widget.retry_uploads_button.isEnabled()
-    history_requested, retries, opened = [], [], []
+    history_requested, retries = [], []
     widget.upload_history_requested.connect(lambda: history_requested.append(True))
     widget.retry_uploads_requested.connect(lambda: retries.append(True))
     widget.upload_history_button.click()
@@ -80,14 +78,13 @@ def test_upload_history_distinguishes_duplicate_and_success_and_retries_only_whe
     ])
     widget.upload_table.selectRow(0)
     assert widget.upload_table.item(0, 3).text() == "网站已存在"
-    assert not widget.open_uploaded_video_button.isEnabled()
-    widget.upload_table.selectRow(1)
-    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
-    widget.open_uploaded_video_button.click()
-    assert opened == ["https://openms.top/video/123"]
+    assert widget.upload_table.item(1, 3).text() == "上传成功"
+    assert widget.upload_table.item(1, 4).text() == "123"
     widget.retry_uploads_button.click()
     assert retries == [True]
     widget.set_auto_upload(False)
+    assert widget.retry_uploads_button.isEnabled()
+    widget.show_login_user(None)
     assert not widget.retry_uploads_button.isEnabled()
 
 

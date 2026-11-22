@@ -5,12 +5,13 @@ from datetime import timedelta, timezone
 from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QFont, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSplitter,
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QSplitter,
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .analysis import LEVEL_NAMES, STATE_NAMES, PersonalAnalysis, ScoreVideo
 from .client import Tournament
+from .ui_icons import icon_button, ui_icon
 
 
 class PersonalAnalysisDialog(QDialog):
@@ -20,6 +21,7 @@ class PersonalAnalysisDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('我的比赛成绩')
+        self.setWindowIcon(ui_icon('score'))
         self.resize(1160, 640)
         self.tournament_id: int | None = None
         self.user_id: int | None = None
@@ -29,7 +31,7 @@ class PersonalAnalysisDialog(QDialog):
         self.heading_label.setWordWrap(True)
         self.heading_label.setTextFormat(Qt.TextFormat.PlainText)
         heading.addWidget(self.heading_label, 1)
-        self.refresh_button = QPushButton('刷新我的成绩')
+        self.refresh_button = icon_button('刷新我的成绩', 'refresh')
         self.refresh_button.clicked.connect(self._refresh)
         self.refresh_button.setEnabled(False)
         heading.addWidget(self.refresh_button)
@@ -72,9 +74,9 @@ class PersonalAnalysisDialog(QDialog):
         estimate_layout.addWidget(self.estimated_group_table)
         estimate_layout.addWidget(self.estimated_slot_table, 1)
         comparison.setSizes([570, 570])
-        self.tabs.addTab(comparison, '计分明细')
+        self.tabs.addTab(comparison, ui_icon('score'), '计分明细')
         self.video_table = self._table(['录像 ID', '难度', '模式', '网站状态', '用时（秒）', '3BV', 'IOE', '计分', '计入情况 / 原因'])
-        self.tabs.addTab(self.video_table, '已提交录像')
+        self.tabs.addTab(self.video_table, ui_icon('upload'), '已提交录像')
         reference_panel = QWidget()
         reference_layout = QVBoxLayout(reference_panel)
         reference_hint = QLabel('金羊杯参考统计：3BV/s、STNB 各自独立取最高的若干局，缺项按 0 补足；不参与官方用时总成绩。')
@@ -82,7 +84,7 @@ class PersonalAnalysisDialog(QDialog):
         reference_layout.addWidget(reference_hint)
         self.reference_table = self._table(['难度', '指标', '取用局数', '补位', '合计', '取用录像 ID'])
         reference_layout.addWidget(self.reference_table)
-        self.tabs.addTab(reference_panel, '金羊杯参考指标')
+        self.tabs.addTab(reference_panel, ui_icon('info'), '金羊杯参考指标')
         self.tabs.setTabVisible(2, False)
         layout.addWidget(self.tabs, 1)
         self.status_label = QLabel('登录后可读取网站关联到自己的比赛录像。')
@@ -95,7 +97,7 @@ class PersonalAnalysisDialog(QDialog):
         footer = QHBoxLayout()
         footer.addWidget(QLabel('双击计分项或录像行，可在元扫雷中播放。'))
         footer.addStretch(1)
-        close_button = QPushButton('关闭')
+        close_button = icon_button('关闭', 'close')
         close_button.clicked.connect(self.close)
         footer.addWidget(close_button)
         layout.addLayout(footer)
