@@ -1,6 +1,6 @@
 [project]
 name = "metasweeper-openms-tournament"
-version = "1.11.0"
+version = "1.12.0"
 description = "元扫雷 OpenMS 比赛与比赛标识插件"
 requires-python = ">=3.11"
 

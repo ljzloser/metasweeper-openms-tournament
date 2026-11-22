@@ -4,9 +4,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QPalette, QPixmap
+from PySide6.QtGui import QCursor, QDesktopServices, QFont, QPalette, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -16,10 +16,38 @@ from .analysis import PersonalAnalysis, supports_scoring
 from .analysis_dialog import PersonalAnalysisDialog
 
 CHINA_TIME = timezone(timedelta(hours=8))
+ANALYSIS_COLUMN = 9
 
 
 def format_time(value: datetime | None) -> str:
     return value.astimezone(CHINA_TIME).strftime("%Y-%m-%d %H:%M") if value else "—"
+
+
+class UploadNotice(QLabel):
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus
+                         | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setAutoFillBackground(True)
+        self.setFrameShape(QFrame.Shape.Box)
+        self.setMargin(12)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    def show_message(self, message: str):
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is None:
+            return
+        self.setText(message)
+        self.adjustSize()
+        work_area = screen.availableGeometry()
+        self.move(max(work_area.left(), work_area.right() - self.width() - 16),
+                  max(work_area.top(), work_area.bottom() - self.height() - 16))
+        self.show()
+        self._hide_timer.start(5000)
 
 
 class TournamentWidget(QWidget):
@@ -175,10 +203,6 @@ class TournamentWidget(QWidget):
         self.analysis_dialog = PersonalAnalysisDialog(self)
         self.analysis_dialog.refresh_requested.connect(self.analysis_requested)
         self.analysis_dialog.replay_requested.connect(self.replay_requested)
-        self.analysis_button = QPushButton("我的成绩")
-        self.analysis_button.setToolTip("先选择比赛，查看本人已提交录像的计分明细；需要登录。")
-        self.analysis_button.clicked.connect(self._open_analysis)
-        options_row.addWidget(self.analysis_button)
         options_row.addWidget(self.upload_history_button)
         layout.addLayout(options_row)
         self.upload_dialog = QDialog(self)
@@ -213,9 +237,9 @@ class TournamentWidget(QWidget):
         close_uploads_button.clicked.connect(self.upload_dialog.close)
         upload_buttons.addWidget(close_uploads_button)
         upload_layout.addLayout(upload_buttons)
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, ANALYSIS_COLUMN + 1)
         self.table.setHorizontalHeaderLabels(
-            ["状态", "比赛", "比赛标识", "我已打卡", "打卡倒计时", "开始时间", "结束时间", "当前成绩", "预计成绩"])
+            ["状态", "比赛", "比赛标识", "我已打卡", "打卡倒计时", "开始时间", "结束时间", "当前成绩", "预计成绩", "操作"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -224,7 +248,7 @@ class TournamentWidget(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.itemSelectionChanged.connect(self._select)
-        self.table.itemDoubleClicked.connect(self._copy_tournament_token)
+        self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
         layout.addWidget(self.table, 1)
         self.window_label = QLabel("选中比赛查看个人参赛时间。")
         self.window_label.setWordWrap(True)
@@ -293,11 +317,6 @@ class TournamentWidget(QWidget):
             bool(self._token) and saved and self._can_apply and self._authorized
             and not self._busy and not self._auth_busy)
         logged_in = self._login_user is not None
-        selected = self.table.item(self.table.currentRow(), 0)
-        tournament = self._tournaments.get(selected.data(Qt.ItemDataRole.UserRole)) if selected is not None else None
-        self.analysis_button.setEnabled(
-            logged_in and tournament is not None and tournament.is_ongoing() and supports_scoring(tournament)
-            and not self._busy and not self._auth_busy)
         self.analysis_dialog.refresh_button.setEnabled(
             logged_in and self.analysis_dialog.tournament_id is not None and not self._busy and not self._auth_busy)
         self.user_id_edit.setEnabled(not logged_in and not self._auth_busy)
@@ -332,6 +351,7 @@ class TournamentWidget(QWidget):
                 continue
             tournament_id = identity_item.data(Qt.ItemDataRole.UserRole)
             tournament = self._tournaments.get(tournament_id)
+            self._update_analysis_button(row, tournament)
             participant = self._participants.get(tournament_id)
             button = cell.findChild(QPushButton, "checkInButton")
             if button is not None:
@@ -440,16 +460,33 @@ class TournamentWidget(QWidget):
         self.upload_dialog.raise_()
         self.upload_history_requested.emit()
 
-    def _open_analysis(self):
-        item = self.table.item(self.table.currentRow(), 0)
-        if not self.analysis_button.isEnabled() or item is None or self._login_user is None:
+    def _analysis_hint(self, tournament: Tournament | None) -> str:
+        if tournament is None or not tournament.is_ongoing():
+            return "比赛进行中可查看我的成绩。"
+        if not supports_scoring(tournament):
+            return "暂不支持这场比赛的成绩分析。"
+        if self._login_user is None:
+            return "登录 OpenMS 后可查看我的成绩。"
+        if self._busy or self._auth_busy:
+            return "请等待当前请求完成。"
+        return ""
+
+    def _update_analysis_button(self, row: int, tournament: Tournament | None):
+        button = self.table.cellWidget(row, ANALYSIS_COLUMN)
+        if button is not None:
+            hint = self._analysis_hint(tournament)
+            button.setEnabled(not hint)
+            button.setToolTip(hint or "查看本场比赛的当前成绩和本地预计成绩。")
+
+    def _open_analysis(self, tournament_id: int):
+        tournament = self._tournaments.get(tournament_id)
+        user = self._login_user
+        if tournament is None or user is None or self._analysis_hint(tournament):
             return
-        tournament = self._tournaments.get(item.data(Qt.ItemDataRole.UserRole))
-        if tournament is not None:
-            self.begin_analysis(tournament, self._login_user.id)
-            self.analysis_dialog.show()
-            self.analysis_dialog.raise_()
-            self.analysis_requested.emit(tournament.id)
+        self.begin_analysis(tournament, user.id)
+        self.analysis_dialog.show()
+        self.analysis_dialog.raise_()
+        self.analysis_requested.emit(tournament_id)
 
     def begin_analysis(self, tournament: Tournament, user_id: int):
         self.analysis_dialog.begin(tournament, user_id)
@@ -475,7 +512,9 @@ class TournamentWidget(QWidget):
         tournament = self._tournaments.get(tournament_id)
         score = self._personal_scores.get(tournament_id) if tournament and tournament.is_ongoing() else None
         unit = " 秒" if tournament and tournament.subclass != "e" else ""
-        for column, value in ((7, score.total if score else None), (8, score.estimated_total if score else None)):
+        current = score.total if score and not score.website_error else None
+        estimated = score.estimated_total if score else None
+        for column, value in ((7, current), (8, estimated)):
             item = self.table.item(row, column)
             if item is not None:
                 item.setText(f"{value:.3f}{unit}" if value is not None else "—")
@@ -623,6 +662,9 @@ class TournamentWidget(QWidget):
                     item = QTableWidgetItem(text)
                     item.setData(Qt.ItemDataRole.UserRole, tournament.id)
                     self.table.setItem(row, column, item)
+                analysis_button = QPushButton("我的成绩")
+                analysis_button.clicked.connect(lambda _checked=False, item_id=tournament.id: self._open_analysis(item_id))
+                self.table.setCellWidget(row, ANALYSIS_COLUMN, analysis_button)
                 token_item = self.table.item(row, 2)
                 if attendance is not None and attendance.token:
                     token_item.setToolTip("双击复制比赛标识。")
@@ -756,6 +798,7 @@ class TournamentWidget(QWidget):
                 tournament_id = item.data(Qt.ItemDataRole.UserRole)
                 self._update_countdown_row(row, tournament_id)
                 self._update_score_row(row, tournament_id)
+                self._update_analysis_button(row, self._tournaments.get(tournament_id))
 
     def set_checkin_busy(self, tournament_id: int, busy: bool):
         if busy:
@@ -808,8 +851,9 @@ class TournamentWidget(QWidget):
             QApplication.clipboard().setText(self._current_identifier)
             self.status_label.setText("已复制当前总比赛标识。")
 
-    def _copy_tournament_token(self, item: QTableWidgetItem):
-        if item.column() != 2 or item.text() in ("", "—", "未公开"):
+    def _on_row_double_clicked(self, item: QTableWidgetItem):
+        if item.column() == 2 and item.text() not in ("", "—", "未公开"):
+            QApplication.clipboard().setText(item.text())
+            self.status_label.setText("已复制该场比赛标识。")
             return
-        QApplication.clipboard().setText(item.text())
-        self.status_label.setText("已复制该场比赛标识。")
+        self._open_analysis(item.data(Qt.ItemDataRole.UserRole))

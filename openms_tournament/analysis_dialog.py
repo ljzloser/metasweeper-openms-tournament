@@ -178,15 +178,13 @@ class PersonalAnalysisDialog(QDialog):
         for group in score_groups:
             groups.append(([LEVEL_NAMES[group.level], f'{group.selected_count} / {len(group.slots)}',
                             str(len(group.slots) - group.selected_count), f'{group.slots[0].value:.3f}',
-                            f'{group.slots[-1].value:.3f}', f'{group.total:.3f}{unit}'], None))
+                            f'{max(slot.value for slot in group.slots):.3f}', f'{group.total:.3f}{unit}'], None))
             for index, slot in enumerate(group.slots, 1):
                 video = slot.video
                 if video is None:
                     source = '补位（规则上限）'
-                elif video.local_digest:
-                    source = '本地未上传'
-                elif video.state == 'unlinked':
-                    source = f'#{video.id} · 等待关联'
+                elif video.id < 0:
+                    source = f'本地记录 #{-video.id}'
                 else:
                     state = STATE_NAMES.get(video.state, video.state)
                     source = f'#{video.id}' if video.state == 'c' else f'#{video.id} · {state}'
@@ -204,20 +202,24 @@ class PersonalAnalysisDialog(QDialog):
             return
         efficiency = result.tournament.subclass == 'e'
         unit = '' if efficiency else ' 秒'
-        self.total_label.setText(f'当前{"效率总分" if efficiency else "总成绩"}：{result.total:.3f}{unit}')
-        self.estimate_title.setText(f'预计成绩：{result.estimated_total:.3f}{unit}')
+        current = f'{result.total:.3f}{unit}' if not result.website_error else '暂不可用'
+        projected = result.estimated_total
+        estimate = f'{projected:.3f}{unit}' if projected is not None else '暂不可用'
+        self.total_label.setText(f'当前{"效率总分" if efficiency else "总成绩"}：{current}')
+        self.estimate_title.setText(f'预计成绩：{estimate}')
         rules = {
             'w': '竞速周赛：取最快的 5 局中级和 2 局高级；中级须低于 60 秒，高级须低于 240 秒，缺项按上限补足。',
             'e': '效率周赛：每局计分 = 用时（秒）÷ IOE²，IOE = 3BV ÷ 点击数。取中级最低 5 局、高级最低 2 局；缺项按 60 / 240 补足。计算使用原始精度。',
             'g': '金羊杯：取最快的初级 20 局、中级 12 局、高级 5 局；3BV 下限为 10 / 30 / 100。缺项按 10 / 60 / 240 秒补足。',
         }
-        self.rule_label.setText(rules[result.tournament.subclass] + ' 仅计入网站审核通过的标准模式录像。')
+        self.rule_label.setText('当前成绩：' + rules[result.tournament.subclass] + ' 仅计入网站审核通过的标准模式录像。')
         counted = sum(video.counted for video in result.videos)
         required = sum(len(group.slots) for group in result.groups)
-        self.count_label.setText(f'网站已关联录像 {len(result.videos)} 局 · 计入 {counted} / {required} 局 · 补位 {required - counted} 项')
+        self.count_label.setText('' if result.website_error else
+                                 f'网站已关联录像 {len(result.videos)} 局 · 计入 {counted} / {required} 局 · 补位 {required - counted} 项')
         self._fill_scores(self.group_table, self.slot_table, result.groups, unit)
         self._fill_scores(self.estimated_group_table, self.estimated_slot_table,
-                          result.estimated_groups or result.groups, unit)
+                          result.estimated_groups, unit)
         rows = []
         for assessment in result.videos:
             video = assessment.video
@@ -231,9 +233,10 @@ class PersonalAnalysisDialog(QDialog):
                                            ', '.join(f'#{video_id}' for video_id, _ in group.values)], None)
                                          for group in result.references])
         self.tabs.setTabVisible(2, bool(result.references))
-        self.show_replay_status(
-            '预计成绩假设符合规则的本地及待审核录像最终获准计分。'
-            f' 网站读取时间：{result.fetched_at.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")}（北京时间）。')
+        website_status = result.website_error or (
+            f'网站读取时间：{result.fetched_at.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")}（北京时间）。')
+        local_status = result.estimate_error or '预计成绩使用插件保存的本地胜局，忽略上传、审核及参赛资格。'
+        self.show_replay_status(f'{local_status}\n{website_status}')
         self.refresh_button.setEnabled(True)
 
     def _refresh(self):

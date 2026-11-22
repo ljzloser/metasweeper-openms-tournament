@@ -4,7 +4,10 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
+from hashlib import sha256
+from math import isfinite
 from pathlib import Path
+from sqlite3 import Error as SQLiteError
 from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Callable
@@ -22,9 +25,9 @@ from shared_types.events import GameFinishedEvent
 
 from .client import LoginUser, OpenmsClient, OpenmsError, Participant, Snapshot, Tournament, UploadError
 from .uploads import UploadJob, UploadQueue
-from .analysis import PersonalAnalysis, ScoreVideo, analyze_personal, supports_scoring
+from .analysis import LEVEL_NAMES, STATE_NAMES, PersonalAnalysis, ScoreVideo, analyze_personal, estimate_local, supports_scoring
 from .request_policy import RateLimitError
-from .widgets import TournamentWidget
+from .widgets import TournamentWidget, UploadNotice
 
 
 class TournamentConfig(OtherInfoBase):
@@ -56,7 +59,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
     @classmethod
     def plugin_info(cls) -> PluginInfo:
         return PluginInfo(
-            name="openms_tournament", display_name="OpenMS 比赛", version="1.11.0",
+            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.0",
             description="查看比赛、批量打卡、维护比赛标识、检查对局条件、上传录像并分析本人比赛成绩。",
             window_mode=WindowMode.TAB, other_info=TournamentConfig,
             icon=QIcon(str(Path(__file__).with_name("icon.svg"))),
@@ -96,6 +99,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         self._analysis_target: tuple[int, int] | None = None
         self._scores: dict[int, PersonalAnalysis] = {}
         self._replay_directory: TemporaryDirectory | None = None
+        self._upload_notice: UploadNotice | None = None
         self._finished.connect(self._on_finished, Qt.ConnectionType.QueuedConnection)
         self._auth_finished.connect(self._on_auth_finished, Qt.ConnectionType.QueuedConnection)
         self.config_changed.connect(self._config_changed)
@@ -189,6 +193,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
 
     def on_shutdown(self):
         self._stopping = True
+        self.run_on_gui(self._close_upload_notice)
         if self._upload_timer is not None:
             self._upload_timer.stop()
             self._upload_timer = None
@@ -517,17 +522,16 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             return snapshot
         analyses = []
         for tournament in snapshot.tournaments:
-            if (not tournament.is_ongoing() or not supports_scoring(tournament)
-                    or snapshot.participant_for(tournament.id) is None):
-                continue
-            try:
-                videos = client.personal_videos(tournament.id, user_id)
-                analyses.append(analyze_personal(tournament, user_id, videos))
-            except RateLimitError:
-                break
-            except OpenmsError as exc:
-                self.logger.debug(f"OpenMS score for {tournament.id}: {exc}")
+            participant = snapshot.participant_for(tournament.id)
+            if tournament.is_ongoing() and supports_scoring(tournament) and participant is not None:
+                analyses.append(self._read_personal_score(client, tournament, user_id))
         return replace(snapshot, analyses=tuple(analyses))
+
+    def _read_personal_score(self, client: OpenmsClient, tournament: Tournament, user_id: int) -> PersonalAnalysis:
+        try:
+            return analyze_personal(tournament, user_id, client.personal_videos(tournament.id, user_id))
+        except OpenmsError as exc:
+            return PersonalAnalysis(tournament, user_id, datetime.now(timezone.utc), (), (), website_error=str(exc))
 
     def _publish_scores(self, *, update_dialog: bool = True):
         if self._login_user is None or self._snapshot is None:
@@ -538,13 +542,15 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
                 if tournament_id not in active or score.user_id != self._login_user.id:
                     self._scores.pop(tournament_id)
                     continue
-                participant = self._snapshot.participant_for(tournament_id)
-                local = (self._uploads.score_videos(score.user_id, tournament_id,
-                                                   can_upload=bool(participant and participant.is_active()))
-                         if self._uploads is not None else ())
-                projected = analyze_personal(score.tournament, score.user_id,
-                                             tuple(item.video for item in score.videos), local_videos=local)
-                self._scores[tournament_id] = replace(score, estimated_groups=projected.estimated_groups)
+                if self._uploads is not None:
+                    try:
+                        wins = self._uploads.score_videos(score.user_id, tournament_id)
+                    except SQLiteError:
+                        self._scores[tournament_id] = replace(
+                            score, estimated_groups=(), estimate_error="本地成绩暂时无法读取，请稍后重试。")
+                    else:
+                        self._scores[tournament_id] = replace(
+                            score, estimated_groups=estimate_local(score.tournament, wins), estimate_error="")
         self._ui("show_scores", tuple(self._scores.values()))
         if update_dialog and self._analysis_target is not None:
             tournament_id, user_id = self._analysis_target
@@ -600,8 +606,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         self._analysis_target = (tournament_id, user_id)
         self._ui("begin_analysis", tournament, user_id)
         client = self._client_for_request()
-        if not self._submit("analysis", lambda: analyze_personal(
-                tournament, user_id, client.personal_videos(tournament_id, user_id))):
+        if not self._submit("analysis", lambda: self._read_personal_score(client, tournament, user_id)):
             self._ui("show_analysis_error", "暂时无法开始查询，请稍后重试。")
 
     @Slot(object)
@@ -618,22 +623,25 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             self._ui("show_replay_status", "无法创建本地录像临时目录。", True)
             return
         directory = Path(self._replay_directory.name)
-        user_id = self._login_user.id
         client = self._client_for_request()
+        user_id = self._login_user.id
         queue = self._uploads
 
         def prepare():
+            website_id = video.id
+            raw = None
             if video.local_digest:
-                raw = queue.replay_bytes(user_id, video.local_digest) if queue is not None else None
-                if not raw:
-                    raise OpenmsError("本地录像已移除，请刷新比赛成绩后重试。")
-                suffix, name = ".evf", f"local-{video.local_digest}"
-            else:
-                name = f"openms-{video.id}"
+                raw, website_id = queue.local_replay(user_id, video.local_digest) if queue is not None else (None, None)
+                if raw is None and website_id is None:
+                    raise OpenmsError("这局保留了本地对局数据，但录像文件已清理或未保存。")
+            if raw is None:
+                name = f"openms-{website_id}"
                 existing = next(directory.glob(f"{name}.*"), None)
                 if existing is not None:
                     return existing, self._send_replay_to_host(existing)
-                suffix, raw = client.download_replay(video.id)
+                suffix, raw = client.download_replay(website_id)
+            else:
+                suffix, name = ".evf", f"local-{video.local_digest}"
             path = directory / f"{name}{suffix}"
             try:
                 path.write_bytes(raw)
@@ -668,7 +676,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         if enabled:
             self._refresh()
 
-    def _upload_tokens(self):
+    def _tournament_tokens(self, *, for_upload: bool):
         now = datetime.now(timezone.utc)
         if (self._snapshot is None or self._login_user is None
                 or self._snapshot.user_id != self._login_user.id):
@@ -676,35 +684,60 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         return {participant.token: (tournament, participant)
                 for tournament in self._snapshot.tournaments if tournament.is_ongoing(now)
                 if (participant := self._snapshot.participant_for(tournament.id)) is not None
-                and participant.user_id == self._login_user.id and participant.is_active(now)}
+                and participant.user_id == self._login_user.id and participant.token
+                and (not for_upload or participant.is_active(now))}
+
+    def _upload_tokens(self):
+        return self._tournament_tokens(for_upload=True)
 
     def _on_game_finished(self, event: GameFinishedEvent):
-        if (self._stopping or not self.other_info.auto_upload or self._login_user is None
-                or event.game_state != GameBoardState.Win.value or event.mode != 0
-                or not event.is_fair or not event.is_official or not event.raw_data):
+        if (self._stopping or self._login_user is None or self._uploads is None
+                or event.game_state not in (GameBoardState.Win.value, GameBoardState.Jowin.value)):
             return
-        available = self._upload_tokens()
-        tokens = tuple(dict.fromkeys(token.strip() for token in event.race_identifier.split(',')
-                                     if token.strip() in available))
-        if not tokens:
-            return
-        deadlines = []
-        for token in tokens:
-            tournament, participant = available[token]
-            limits = [value.timestamp() for value in (tournament.ends_at, participant.ends_at) if value is not None]
-            deadlines.append(min(limits) if limits else None)
-        deadline = None if None in deadlines else max(deadlines)
+        identifiers = tuple(dict.fromkeys(token.strip() for token in event.race_identifier.split(',') if token.strip()))
+        local_matches = self._tournament_tokens(for_upload=False)
+        tournaments = {local_matches[token][0].id: local_matches[token][0]
+                       for token in identifiers if token in local_matches}
+        can_upload = (self.other_info.auto_upload and event.game_state == GameBoardState.Win.value
+                      and event.mode == 0 and event.is_fair and event.is_official and bool(event.raw_data))
+        available = self._upload_tokens() if can_upload else {}
+        tokens = tuple(token for token in identifiers if token in available)
+        raw = bytes(event.raw_data) if event.raw_data else None
         level = {3: "b", 4: "i", 5: "e"}.get(event.level)
+        timems = round(event.rtime * 1000) if isfinite(event.rtime) and event.rtime > 0 else None
+        user_id = self._login_user.id
         try:
-            if self._uploads is not None and self._uploads.enqueue(
-                    self._login_user.id, bytes(event.raw_data), tokens, deadline,
+            if tournaments and level and timems is not None:
+                end_times = [item.ends_at.timestamp() if item.ends_at is not None else None
+                             for item in tournaments.values()]
+                identity = raw or repr((event.start_time, event.end_time, event.mode, level, timems,
+                                        event.bbbv, event.cl, identifiers)).encode("utf-8")
+                if self._uploads.record_win(
+                        user_id, sha256(identity).hexdigest(), tuple(tournaments),
+                        None if None in end_times else max(end_times), level, timems, event.bbbv, event.cl,
+                        None if tokens else raw):
+                    for tournament in tournaments.values():
+                        if supports_scoring(tournament) and tournament.id not in self._scores:
+                            self._scores[tournament.id] = PersonalAnalysis(
+                                tournament, user_id, datetime.now(timezone.utc), (), (),
+                                website_error="网站成绩尚未读取，请刷新。")
+                    self._publish_scores(update_dialog=self._network_kind not in ("analysis", "replay"))
+            if not tokens or raw is None:
+                return
+            deadlines = []
+            for token in tokens:
+                tournament, participant = available[token]
+                limits = [value.timestamp() for value in (tournament.ends_at, participant.ends_at) if value is not None]
+                deadlines.append(min(limits) if limits else None)
+            if self._uploads.enqueue(
+                    user_id, raw, tokens, None if None in deadlines else max(deadlines),
                     tuple(dict.fromkeys(available[token][0].id for token in tokens)),
-                    level=level, timems=round(event.rtime * 1000), bv=event.bbbv, clicks=event.cl):
+                    level=level, timems=timems, bv=event.bbbv, clicks=event.cl):
                 self._show_upload_records()
                 self._process_upload_queue()
         except Exception:
             self.logger.exception("Failed to save the OpenMS upload outbox")
-            self._ui("set_busy", False, "比赛录像无法加入上传队列，请检查插件数据目录和磁盘空间。")
+            self._ui("set_busy", False, "无法保存比赛对局，请检查插件数据目录和磁盘空间。")
 
     @Slot()
     def _show_upload_records(self):
@@ -713,8 +746,6 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             if records != self._upload_record_cache:
                 self._upload_record_cache = records
                 self._ui("set_upload_records", records)
-                if self._scores:
-                    self._publish_scores(update_dialog=self._network_kind not in ("analysis", "replay"))
 
     @Slot()
     def _retry_uploads(self):
@@ -736,7 +767,10 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
                                  for tournament_id, participant in snapshot.participants
                                  if participant is not None and participant.user_id == snapshot.user_id}
             self._uploads.retain_tournaments(ids, user_id=snapshot.user_id,
-                                             token_tournaments=token_tournaments)
+                                             token_tournaments=token_tournaments,
+                                             tournament_deadlines={item.id: item.ends_at.timestamp()
+                                                                   for item in snapshot.tournaments
+                                                                   if item.ends_at is not None})
         self._show_upload_records()
 
     @Slot()
@@ -794,11 +828,33 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             message = "网站已存在该录像，已从待上传队列移除，不再重试。"
             self._uploads.finish(job, "duplicate", message)
         else:
-            state_text = {"a": "待审核", "b": "已冻结", "c": "审核通过", "d": "玩家标识不匹配", "e": "外站审核"}
-            message = f"录像 #{result.video_id} 上传成功，网站状态：{state_text.get(result.state, result.state)}；比赛是否计分以网站为准。"
+            website_state = STATE_NAMES.get(result.state, result.state or "未返回")
+            details = [f"录像 #{result.video_id}", "胜利"]
+            if job.level in LEVEL_NAMES:
+                details.insert(1, LEVEL_NAMES[job.level])
+            if job.timems is not None:
+                details.append(f"{job.timems / 1000:.3f} 秒")
+            if job.bv is not None:
+                details.append(f"3BV {job.bv}")
+            details.append(f"网站状态：{website_state}")
+            message = "比赛录像上传成功 · " + " · ".join(details)
             self._uploads.finish(job, "succeeded", message, video_id=result.video_id, state=result.state)
+            self.run_on_gui(self._show_upload_notice, "\n".join(("OpenMS 比赛录像上传成功",
+                                                                  " · ".join(details[:-1]), details[-1])))
         self._ui("set_busy", False, message)
         self._cleanup_uploads()
+
+    def _show_upload_notice(self, message: str):
+        if not self._stopping:
+            if self._upload_notice is None:
+                self._upload_notice = UploadNotice()
+            self._upload_notice.show_message(message)
+
+    def _close_upload_notice(self):
+        notice, self._upload_notice = self._upload_notice, None
+        if notice is not None:
+            notice.hide()
+            notice.deleteLater()
 
     def _schedule_context_refresh(self):
         if self._context_debounce is not None and not self._stopping:
@@ -965,6 +1021,9 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             self._ui("show_error", "该比赛尚未开始或已经结束，无法设置比赛标识。")
         elif self._snapshot.user_id is None:
             self._ui("show_error", "请填写并保存 OpenMS 用户 ID，以读取本人的参赛标识。")
+        elif tournament_id in dict(self._snapshot.participants):
+            self._participant = self._snapshot.participant_for(tournament_id)
+            self._ui("show_participant", self._selected, self._participant)
         else:
             client = self._client_for_request()
             user_id = self._snapshot.user_id

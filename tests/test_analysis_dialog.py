@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from openms_tournament.analysis import ScoreVideo, analyze_personal
 from openms_tournament.analysis_dialog import PersonalAnalysisDialog
 from openms_tournament.client import LoginUser, Snapshot, Tournament
-from openms_tournament.widgets import TournamentWidget
+from openms_tournament.widgets import ANALYSIS_COLUMN, TournamentWidget
 
 
 def test_dialog_shows_counted_and_default_slots_and_opens_only_real_videos(qtbot):
@@ -36,18 +36,18 @@ def test_dialog_does_not_display_late_result_for_different_account_or_race(qtbot
     assert dialog.total_label.text() == ''
 
 
-def test_analysis_requires_login_and_selection_and_clears_on_scope_or_account_change(qtbot):
+def test_row_analysis_requires_login_and_clears_on_scope_or_account_change(qtbot):
     tournament = Tournament(30, '测试周赛', 'ongoing', None, None)
     widget = TournamentWidget()
     qtbot.addWidget(widget)
     widget.show_snapshot(Snapshot((tournament,), 7, datetime.now(timezone.utc)))
-    widget.table.selectRow(0)
-    assert not widget.analysis_button.isEnabled()
+    button = widget.table.cellWidget(0, ANALYSIS_COLUMN)
+    assert not button.isEnabled()
     widget.show_login_user(LoginUser(7, 'tester'))
-    assert widget.analysis_button.isEnabled()
+    assert button.isEnabled()
     requests = []
     widget.analysis_requested.connect(requests.append)
-    widget.analysis_button.click()
+    button.click()
     assert requests == [30]
     widget.show_analysis(analyze_personal(tournament, 7, ()))
     assert widget.analysis_dialog.total_label.text()

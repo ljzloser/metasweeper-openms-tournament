@@ -22,6 +22,9 @@ class UploadJob:
     deadline: float | None
     attempts: int
     raw_data: bytes = field(repr=False)
+    level: str | None = None
+    timems: int | None = None
+    bv: int | None = None
 
 
 class UploadQueue:
@@ -46,6 +49,16 @@ class UploadQueue:
             for column, kind in (('level', 'TEXT'), ('timems', 'INTEGER'), ('bv', 'INTEGER'), ('clicks', 'INTEGER')):
                 if column not in columns:
                     database.execute(f"ALTER TABLE uploads ADD COLUMN {column} {kind}")
+            existing = database.execute("SELECT 1 FROM sqlite_master WHERE name='local_wins'").fetchone()
+            database.execute("""CREATE TABLE IF NOT EXISTS local_wins (
+                digest TEXT NOT NULL, user_id INTEGER NOT NULL, tournament_ids TEXT NOT NULL, deadline REAL,
+                level TEXT NOT NULL, timems INTEGER NOT NULL, bv INTEGER NOT NULL, clicks INTEGER,
+                raw_data BLOB, video_id INTEGER, PRIMARY KEY (digest, user_id))""")
+            if existing is None:
+                database.execute("""INSERT INTO local_wins
+                    (digest,user_id,tournament_ids,level,timems,bv,clicks,video_id)
+                    SELECT digest,user_id,tournament_ids,level,timems,bv,clicks,video_id FROM uploads
+                    WHERE level IS NOT NULL AND timems IS NOT NULL AND bv IS NOT NULL AND tournament_ids<>'[]'""")
             database.execute("UPDATE uploads SET status='pending', message='恢复中断的上传，等待确认' WHERE status='uploading'")
         self.purge_expired()
 
@@ -61,8 +74,8 @@ class UploadQueue:
             database.close()
 
     def enqueue(self, user_id: int, raw_data: bytes, tokens: tuple[str, ...], deadline: float | None,
-                tournament_ids: tuple[int, ...] = (), *, level: str | None = None,
-                timems: int | None = None, bv: int | None = None, clicks: int | None = None) -> bool:
+                tournament_ids: tuple[int, ...] = (), *, level: str | None = None, timems: int | None = None,
+                bv: int | None = None, clicks: int | None = None) -> bool:
         digest = hashlib.sha256(raw_data).hexdigest()
         now = time.time()
         filename = datetime.fromtimestamp(now, timezone.utc).strftime('%Y%m%d-%H%M%S-') + digest[:12] + '.evf'
@@ -70,45 +83,48 @@ class UploadQueue:
             cursor = database.execute("""INSERT OR IGNORE INTO uploads
                 (digest,user_id,filename,tokens,deadline,created,raw_data,tournament_ids,level,timems,bv,clicks)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (digest, user_id, filename, json.dumps(tokens), deadline, now, raw_data,
-                 json.dumps(tournament_ids), level, timems, bv, clicks))
+                (digest, user_id, filename, json.dumps(tokens), deadline, now, raw_data, json.dumps(tournament_ids),
+                 level, timems, bv, clicks))
             return cursor.rowcount == 1
 
-    def score_videos(self, user_id: int, tournament_id: int, *, can_upload: bool) -> tuple[ScoreVideo, ...]:
+    def record_win(self, user_id: int, digest: str, tournament_ids: tuple[int, ...],
+                   deadline: float | None, level: str, timems: int, bv: int, clicks: int,
+                   raw_data: bytes | None) -> bool:
         with self._connect() as database:
-            rows = database.execute("""SELECT rowid, digest, tournament_ids, status, video_id, website_state,
-                level, timems, bv, clicks FROM uploads WHERE user_id=? AND level IS NOT NULL
-                AND timems IS NOT NULL AND bv IS NOT NULL AND (deadline IS NULL OR deadline>?)
-                AND (status='succeeded' OR (? AND raw_data IS NOT NULL
-                     AND status IN ('pending','retry','uploading','failed')))""",
-                                    (user_id, time.time(), can_upload)).fetchall()
-        videos = {}
-        for row in rows:
-            if tournament_id not in json.loads(row['tournament_ids']):
-                continue
-            uploaded = row['status'] == 'succeeded'
-            if uploaded and (not row['video_id'] or row['website_state'] not in ('', 'a', 'c', 'e')):
-                continue
-            video_id = row['video_id'] if uploaded else -row['rowid']
-            videos[video_id] = ScoreVideo(video_id, row['level'], '00', 'unlinked' if uploaded else 'local',
-                                          row['timems'], row['bv'], row['clicks'],
-                                          '' if uploaded else row['digest'])
-        return tuple(videos.values())
+            cursor = database.execute("""INSERT OR IGNORE INTO local_wins
+                (digest,user_id,tournament_ids,deadline,level,timems,bv,clicks,raw_data,video_id)
+                VALUES (?,?,?,?,?,?,?,?,?,(SELECT video_id FROM uploads WHERE digest=? AND user_id=?))""",
+                (digest, user_id, json.dumps(tournament_ids), deadline, level, timems, bv, clicks, raw_data,
+                 digest, user_id))
+            return cursor.rowcount == 1
 
-    def replay_bytes(self, user_id: int, digest: str) -> bytes | None:
+    def score_videos(self, user_id: int, tournament_id: int) -> tuple[ScoreVideo, ...]:
         with self._connect() as database:
-            row = database.execute("""SELECT raw_data FROM uploads WHERE user_id=? AND digest=?
-                AND (deadline IS NULL OR deadline>?)""", (user_id, digest, time.time())).fetchone()
-        return row['raw_data'] if row else None
+            rows = database.execute("""SELECT rowid,digest,tournament_ids,level,timems,bv,clicks
+                FROM local_wins WHERE user_id=? AND (deadline IS NULL OR deadline>?)""",
+                (user_id, time.time())).fetchall()
+        return tuple(ScoreVideo(-row['rowid'], row['level'], '', 'local', row['timems'], row['bv'], row['clicks'],
+                                row['digest']) for row in rows if tournament_id in json.loads(row['tournament_ids']))
+
+    def local_replay(self, user_id: int, digest: str) -> tuple[bytes | None, int | None]:
+        with self._connect() as database:
+            row = database.execute("""SELECT COALESCE(local_wins.raw_data, uploads.raw_data), local_wins.video_id
+                FROM local_wins LEFT JOIN uploads USING (user_id,digest)
+                WHERE local_wins.user_id=? AND local_wins.digest=?
+                  AND (local_wins.deadline IS NULL OR local_wins.deadline>?)""",
+                (user_id, digest, time.time())).fetchone()
+        return (row[0], row[1]) if row else (None, None)
 
     def purge_expired(self, now: float | None = None) -> int:
         """Remove every expired task, including success/history and other accounts."""
         now = time.time() if now is None else now
         with self._connect() as database:
+            database.execute("DELETE FROM local_wins WHERE deadline<=?", (now,))
             return database.execute("DELETE FROM uploads WHERE deadline<=? OR status='expired'", (now,)).rowcount
 
     def retain_tournaments(self, tournament_ids: set[int], *, user_id: int | None = None,
-                           token_tournaments: dict[str, int] | None = None) -> int:
+                           token_tournaments: dict[str, int] | None = None,
+                           tournament_deadlines: dict[int, float | None] | None = None) -> int:
         """Called only with a successfully fetched authoritative tournament list."""
         removed = 0
         with self._connect() as database:
@@ -126,6 +142,16 @@ class UploadQueue:
                 else:
                     removed += database.execute('DELETE FROM uploads WHERE digest=? AND user_id=?',
                                                 (row['digest'], row['user_id'])).rowcount
+            deadlines = tournament_deadlines or {}
+            for row in database.execute('SELECT rowid,tournament_ids,deadline FROM local_wins').fetchall():
+                active = sorted(tournament_ids.intersection(json.loads(row['tournament_ids'])))
+                if not active:
+                    database.execute('DELETE FROM local_wins WHERE rowid=?', (row['rowid'],))
+                    continue
+                end_times = [deadlines.get(tournament_id) for tournament_id in active]
+                deadline = max(end_times) if None not in end_times else row['deadline']
+                database.execute('UPDATE local_wins SET tournament_ids=?, deadline=? WHERE rowid=?',
+                                 (json.dumps(active), deadline, row['rowid']))
         return removed
 
     def discard(self, job: UploadJob):
@@ -142,7 +168,7 @@ class UploadQueue:
         if row is None:
             return None
         return UploadJob(row['digest'], row['user_id'], row['filename'], tuple(json.loads(row['tokens'])),
-                         row['deadline'], row['attempts'], row['raw_data'])
+                         row['deadline'], row['attempts'], row['raw_data'], row['level'], row['timems'], row['bv'])
 
     def start(self, job: UploadJob):
         with self._connect() as database:
@@ -155,6 +181,8 @@ class UploadQueue:
         with self._connect() as database:
             database.execute("""UPDATE uploads SET status=?, raw_data=NULL, message=?, video_id=?, website_state=?
                 WHERE digest=? AND user_id=?""", (status, message, video_id, state, job.digest, job.user_id))
+            database.execute("""UPDATE local_wins SET raw_data=NULL, video_id=COALESCE(?,video_id)
+                WHERE digest=? AND user_id=?""", (video_id, job.digest, job.user_id))
 
     def fail(self, job: UploadJob, message: str, *, retryable: bool, needs_login: bool = False,
              retry_after: float | None = None, rate_limited: bool = False):

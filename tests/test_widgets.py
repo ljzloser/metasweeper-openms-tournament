@@ -122,7 +122,7 @@ def test_checkin_column_requires_login_confirms_start_and_shows_countdown(qtbot,
     widget.show_login_user(LoginUser(7, "tester"))
     tournament = Tournament(30, "周赛", "ongoing", None, None)
     widget.show_snapshot(Snapshot((tournament,), 7, datetime.now(timezone.utc), ((30, None),)))
-    assert widget.table.columnCount() == 9
+    assert widget.table.columnCount() == 10
     assert widget.table.horizontalHeaderItem(2).text() == "比赛标识"
     assert widget.table.horizontalHeaderItem(3).text() == "我已打卡"
     assert widget.table.horizontalHeaderItem(4).text() == "打卡倒计时"

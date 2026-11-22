@@ -91,14 +91,16 @@ class PersonalAnalysis:
     videos: tuple[VideoAssessment, ...]
     references: tuple[ReferenceGroup, ...] = ()
     estimated_groups: tuple[ScoreGroup, ...] = ()
+    website_error: str = ''
+    estimate_error: str = ''
 
     @property
     def total(self) -> float:
         return fsum(group.total for group in self.groups)
 
     @property
-    def estimated_total(self) -> float:
-        return fsum(group.total for group in (self.estimated_groups or self.groups))
+    def estimated_total(self) -> float | None:
+        return fsum(group.total for group in self.estimated_groups) if self.estimated_groups else None
 
 
 def supports_scoring(tournament: Tournament) -> bool:
@@ -108,30 +110,36 @@ def supports_scoring(tournament: Tournament) -> bool:
 def _score_groups(counts, eligible) -> tuple[ScoreGroup, ...]:
     groups = []
     for level, count in counts.items():
-        selected = sorted(eligible[level], key=lambda pair: (pair[1], pair[0].id < 0, pair[0].id))[:count]
+        selected = sorted(eligible[level], key=lambda pair: (pair[1], abs(pair[0].id)))[:count]
         slots = [ScoreSlot(video, value) for video, value in selected]
         slots.extend(ScoreSlot(None, TIME_LIMITS[level]) for _ in range(count - len(slots)))
         groups.append(ScoreGroup(level, tuple(slots)))
     return tuple(groups)
 
 
-def analyze_personal(tournament: Tournament, user_id: int, videos: tuple[ScoreVideo, ...], *,
-                     local_videos: tuple[ScoreVideo, ...] = ()) -> PersonalAnalysis:
+def estimate_local(tournament: Tournament, wins: tuple[ScoreVideo, ...]) -> tuple[ScoreGroup, ...]:
+    counts = COUNTS[tournament.subclass]
+    eligible: dict[str, list[tuple[ScoreVideo, float]]] = {level: [] for level in counts}
+    for video in wins:
+        value = video.efficiency_score if tournament.subclass == 'e' else video.seconds
+        if video.level in counts and value is not None and value > 0:
+            eligible[video.level].append((video, value))
+    return _score_groups(counts, eligible)
+
+
+def analyze_personal(tournament: Tournament, user_id: int, videos: tuple[ScoreVideo, ...]) -> PersonalAnalysis:
     if not supports_scoring(tournament):
         raise OpenmsError('暂不支持该比赛赛制的成绩分析。')
     if len({video.id for video in videos}) != len(videos):
         raise OpenmsError('网站返回了重复录像 ID，无法可靠计算成绩。')
     counts = COUNTS[tournament.subclass]
     eligible: dict[str, list[tuple[ScoreVideo, float]]] = {level: [] for level in counts}
-    estimated: dict[str, list[tuple[ScoreVideo, float]]] = {level: [] for level in counts}
     results: dict[int, VideoAssessment] = {}
     reference_candidates: dict[str, list[ScoreVideo]] = {level: [] for level in counts}
-    website_ids = {video.id for video in videos}
-    candidates = videos + tuple(video for video in local_videos if video.id not in website_ids)
-    for video in candidates:
+    for video in videos:
         value = video.efficiency_score if tournament.subclass == 'e' else video.seconds
         reason = ''
-        if video.state not in ('a', 'c', 'e', 'local', 'unlinked'):
+        if video.state != 'c':
             reason = STATE_NAMES.get(video.state, '未知审核状态') + '，不计分'
         elif video.mode != '00':
             reason = '非标准模式，不计分'
@@ -142,21 +150,16 @@ def analyze_personal(tournament: Tournament, user_id: int, videos: tuple[ScoreVi
         elif tournament.subclass == 'g' and video.bv < GSC_BV_MIN[video.level]:
             reason = f'3BV 未达到 {GSC_BV_MIN[video.level]} 的计分下限'
         else:
-            if tournament.subclass == 'g' and video.state == 'c':
+            if tournament.subclass == 'g':
                 reference_candidates[video.level].append(video)
             if value is None:
                 reason = '缺少有效点击数或 3BV，无法计算效率分'
             elif value >= TIME_LIMITS[video.level]:
                 reason = f'{"效率分" if tournament.subclass == "e" else "用时"}未低于 {TIME_LIMITS[video.level]} 的计分上限'
             else:
-                estimated[video.level].append((video, value))
-                if video.state == 'c':
-                    eligible[video.level].append((video, value))
-                    reason = '有效录像，未进入本难度取用名额'
-                else:
-                    reason = STATE_NAMES.get(video.state, '等待网站计入') + '，仅参与预计'
-        if video.id in website_ids:
-            results[video.id] = VideoAssessment(video, value, False, reason)
+                eligible[video.level].append((video, value))
+                reason = '有效录像，未进入本难度取用名额'
+        results[video.id] = VideoAssessment(video, value, False, reason)
     groups = _score_groups(counts, eligible)
     for group in groups:
         for slot in group.slots:
@@ -172,5 +175,4 @@ def analyze_personal(tournament: Tournament, user_id: int, videos: tuple[ScoreVi
                 selected = sorted(pairs, key=lambda pair: (-pair[1], pair[0]))[:count]
                 references.append(ReferenceGroup(level, metric, tuple(selected), count - len(selected)))
     return PersonalAnalysis(tournament, user_id, datetime.now(timezone.utc), groups,
-                            tuple(results[video.id] for video in videos), tuple(references),
-                            _score_groups(counts, estimated))
+                            tuple(results[video.id] for video in videos), tuple(references))

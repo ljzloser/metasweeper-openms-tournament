@@ -16,6 +16,7 @@ from openms_tournament.client import Captcha, LoginUser, OpenmsError, Participan
 from openms_tournament.plugin import OpenmsTournamentPlugin, TournamentConfig
 from openms_tournament.uploads import UploadQueue
 from openms_tournament.analysis import ScoreVideo
+from openms_tournament.widgets import ANALYSIS_COLUMN
 
 
 def snapshot(user_id=7):
@@ -313,8 +314,9 @@ def test_personal_analysis_query_and_computation_run_off_ui_thread(factory, monk
     widget = plugin.widget
     qtbot.waitUntil(lambda: widget.table.rowCount() == 2)
     widget.table.selectRow(0)
-    qtbot.waitUntil(lambda: plugin._participant is not None and plugin._future is None and widget.analysis_button.isEnabled())
-    widget.analysis_button.click()
+    button = widget.table.cellWidget(0, ANALYSIS_COLUMN)
+    qtbot.waitUntil(lambda: plugin._participant is not None and plugin._future is None and button.isEnabled())
+    button.click()
     qtbot.waitUntil(lambda: '740.000' in widget.analysis_dialog.total_label.text())
     assert calls == [(30, 7, calls[0][2])]
     assert calls[0][2] != get_ident()
