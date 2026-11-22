@@ -27,7 +27,7 @@ from .client import LoginUser, OpenmsClient, OpenmsError, Participant, Snapshot,
 from .uploads import UploadJob, UploadQueue
 from .analysis import LEVEL_NAMES, STATE_NAMES, PersonalAnalysis, ScoreVideo, analyze_personal, estimate_local, supports_scoring
 from .request_policy import RateLimitError
-from .widgets import TournamentWidget, UploadNotice
+from .widgets import TournamentWidget
 
 
 class TournamentConfig(OtherInfoBase):
@@ -59,7 +59,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
     @classmethod
     def plugin_info(cls) -> PluginInfo:
         return PluginInfo(
-            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.0",
+            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.2",
             description="查看比赛、批量打卡、维护比赛标识、检查对局条件、上传录像并分析本人比赛成绩。",
             window_mode=WindowMode.TAB, other_info=TournamentConfig,
             icon=QIcon(str(Path(__file__).with_name("icon.svg"))),
@@ -99,7 +99,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         self._analysis_target: tuple[int, int] | None = None
         self._scores: dict[int, PersonalAnalysis] = {}
         self._replay_directory: TemporaryDirectory | None = None
-        self._upload_notice: UploadNotice | None = None
+        self._pending_upload_notice = ""
         self._finished.connect(self._on_finished, Qt.ConnectionType.QueuedConnection)
         self._auth_finished.connect(self._on_auth_finished, Qt.ConnectionType.QueuedConnection)
         self.config_changed.connect(self._config_changed)
@@ -138,10 +138,17 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         if self._uploads is not None:
             widget.set_upload_records(self._uploads.records())
         widget.show_scores(tuple(self._scores.values()))
+        if self._pending_upload_notice:
+            widget.show_upload_notice(self._pending_upload_notice)
+            self._pending_upload_notice = ""
         return widget
 
     def on_widget_created(self, widget):
         self._enqueue_event(lambda _: (self._refresh(), self._refresh_game_context()), None)
+
+    def on_widget_closed(self, widget):
+        if isinstance(widget, TournamentWidget) and not self._stopping:
+            self._pending_upload_notice = widget.upload_notice_message
 
     def on_initialized(self):
         self._stopping = False
@@ -193,7 +200,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
 
     def on_shutdown(self):
         self._stopping = True
-        self.run_on_gui(self._close_upload_notice)
+        self._pending_upload_notice = ""
         if self._upload_timer is not None:
             self._upload_timer.stop()
             self._upload_timer = None
@@ -529,9 +536,16 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
 
     def _read_personal_score(self, client: OpenmsClient, tournament: Tournament, user_id: int) -> PersonalAnalysis:
         try:
-            return analyze_personal(tournament, user_id, client.personal_videos(tournament.id, user_id))
+            videos = client.personal_videos(tournament.id, user_id)
+            result = analyze_personal(tournament, user_id, videos)
         except OpenmsError as exc:
             return PersonalAnalysis(tournament, user_id, datetime.now(timezone.utc), (), (), website_error=str(exc))
+        if self._uploads is not None:
+            try:
+                self._uploads.restore_legacy_scores(user_id, tournament.id, videos)
+            except SQLiteError as exc:
+                self.logger.warning(f"OpenMS 补录旧版战绩失败: {exc}")
+        return result
 
     def _publish_scores(self, *, update_dialog: bool = True):
         if self._login_user is None or self._snapshot is None:
@@ -839,22 +853,19 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
             details.append(f"网站状态：{website_state}")
             message = "比赛录像上传成功 · " + " · ".join(details)
             self._uploads.finish(job, "succeeded", message, video_id=result.video_id, state=result.state)
-            self.run_on_gui(self._show_upload_notice, "\n".join(("OpenMS 比赛录像上传成功",
-                                                                  " · ".join(details[:-1]), details[-1])))
+            self.run_on_gui(self._show_upload_notice, message)
+            message = "上传记录已更新。"
         self._ui("set_busy", False, message)
         self._cleanup_uploads()
 
     def _show_upload_notice(self, message: str):
-        if not self._stopping:
-            if self._upload_notice is None:
-                self._upload_notice = UploadNotice()
-            self._upload_notice.show_message(message)
-
-    def _close_upload_notice(self):
-        notice, self._upload_notice = self._upload_notice, None
-        if notice is not None:
-            notice.hide()
-            notice.deleteLater()
+        if self._stopping:
+            return
+        widget = self.widget
+        if isinstance(widget, TournamentWidget):
+            widget.show_upload_notice(message)
+        else:
+            self._pending_upload_notice = message
 
     def _schedule_context_refresh(self):
         if self._context_debounce is not None and not self._stopping:

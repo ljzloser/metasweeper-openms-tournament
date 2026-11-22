@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 import time
 
-from .analysis import ScoreVideo
+from .analysis import LEVEL_NAMES, ScoreVideo
 
 
 @dataclass(frozen=True)
@@ -49,16 +49,18 @@ class UploadQueue:
             for column, kind in (('level', 'TEXT'), ('timems', 'INTEGER'), ('bv', 'INTEGER'), ('clicks', 'INTEGER')):
                 if column not in columns:
                     database.execute(f"ALTER TABLE uploads ADD COLUMN {column} {kind}")
-            existing = database.execute("SELECT 1 FROM sqlite_master WHERE name='local_wins'").fetchone()
             database.execute("""CREATE TABLE IF NOT EXISTS local_wins (
                 digest TEXT NOT NULL, user_id INTEGER NOT NULL, tournament_ids TEXT NOT NULL, deadline REAL,
                 level TEXT NOT NULL, timems INTEGER NOT NULL, bv INTEGER NOT NULL, clicks INTEGER,
                 raw_data BLOB, video_id INTEGER, PRIMARY KEY (digest, user_id))""")
-            if existing is None:
-                database.execute("""INSERT INTO local_wins
-                    (digest,user_id,tournament_ids,level,timems,bv,clicks,video_id)
-                    SELECT digest,user_id,tournament_ids,level,timems,bv,clicks,video_id FROM uploads
-                    WHERE level IS NOT NULL AND timems IS NOT NULL AND bv IS NOT NULL AND tournament_ids<>'[]'""")
+            database.execute("""INSERT OR IGNORE INTO local_wins
+                (digest,user_id,tournament_ids,level,timems,bv,clicks,video_id)
+                SELECT digest,user_id,tournament_ids,COALESCE(level,''),
+                       CASE WHEN level IS NOT NULL AND bv IS NOT NULL THEN COALESCE(timems,0) ELSE 0 END,
+                       COALESCE(bv,0),clicks,video_id
+                FROM uploads WHERE tournament_ids<>'[]' AND (
+                    (level IS NOT NULL AND timems>0 AND bv IS NOT NULL) OR (status='succeeded' AND video_id>0)
+                )""")
             database.execute("UPDATE uploads SET status='pending', message='恢复中断的上传，等待确认' WHERE status='uploading'")
         self.purge_expired()
 
@@ -101,10 +103,24 @@ class UploadQueue:
     def score_videos(self, user_id: int, tournament_id: int) -> tuple[ScoreVideo, ...]:
         with self._connect() as database:
             rows = database.execute("""SELECT rowid,digest,tournament_ids,level,timems,bv,clicks
-                FROM local_wins WHERE user_id=? AND (deadline IS NULL OR deadline>?)""",
+                FROM local_wins WHERE user_id=? AND timems>0 AND (deadline IS NULL OR deadline>?)""",
                 (user_id, time.time())).fetchall()
         return tuple(ScoreVideo(-row['rowid'], row['level'], '', 'local', row['timems'], row['bv'], row['clicks'],
                                 row['digest']) for row in rows if tournament_id in json.loads(row['tournament_ids']))
+
+    def restore_legacy_scores(self, user_id: int, tournament_id: int, videos: tuple[ScoreVideo, ...]):
+        available = {video.id: video for video in videos if video.timems > 0 and video.level in LEVEL_NAMES}
+        if not available:
+            return
+        with self._connect() as database:
+            missing = database.execute("""SELECT rowid,video_id,tournament_ids FROM local_wins
+                WHERE user_id=? AND timems=0 AND video_id IS NOT NULL AND (deadline IS NULL OR deadline>?)""",
+                (user_id, time.time())).fetchall()
+            for row in missing:
+                video = available.get(row['video_id'])
+                if video is not None and tournament_id in json.loads(row['tournament_ids']):
+                    database.execute("""UPDATE local_wins SET level=?,timems=?,bv=?,clicks=?
+                        WHERE rowid=? AND timems=0""", (video.level, video.timems, video.bv, video.clicks, row['rowid']))
 
     def local_replay(self, user_id: int, digest: str) -> tuple[bytes | None, int | None]:
         with self._connect() as database:

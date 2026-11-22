@@ -4,9 +4,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QCursor, QDesktopServices, QFont, QPalette, QPixmap
+from PySide6.QtGui import QDesktopServices, QFont, QHideEvent, QPalette, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -25,29 +25,35 @@ def format_time(value: datetime | None) -> str:
 
 class UploadNotice(QLabel):
     def __init__(self):
-        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus
-                         | Qt.WindowType.WindowTransparentForInput)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        super().__init__()
         self.setTextFormat(Qt.TextFormat.PlainText)
-        self.setAutoFillBackground(True)
-        self.setFrameShape(QFrame.Shape.Box)
-        self.setMargin(12)
+        self.setStyleSheet(
+            "QLabel { color: palette(text); background: palette(alternate-base); "
+            "border: 1px solid palette(mid); border-radius: 4px; padding: 4px 8px; }")
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self.hide)
+        self._hide_timer.setInterval(5000)
+        self._hide_timer.timeout.connect(self._dismiss)
+        self.hide()
 
     def show_message(self, message: str):
-        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-        if screen is None:
-            return
         self.setText(message)
-        self.adjustSize()
-        work_area = screen.availableGeometry()
-        self.move(max(work_area.left(), work_area.right() - self.width() - 16),
-                  max(work_area.top(), work_area.bottom() - self.height() - 16))
         self.show()
-        self._hide_timer.start(5000)
+        if self.isVisible() and not self.window().isMinimized():
+            self._hide_timer.start()
+
+    def showEvent(self, event: QShowEvent):
+        super().showEvent(event)
+        if self.text():
+            self._hide_timer.start()
+
+    def hideEvent(self, event: QHideEvent):
+        self._hide_timer.stop()
+        super().hideEvent(event)
+
+    def _dismiss(self):
+        self.clear()
+        self.hide()
 
 
 class TournamentWidget(QWidget):
@@ -90,6 +96,8 @@ class TournamentWidget(QWidget):
         self._checkin_all_busy = False
         self._condition_details: list[str] = []
         layout = QVBoxLayout(self)
+        self._upload_notice = UploadNotice()
+        layout.addWidget(self._upload_notice)
         title = QLabel("OpenMS 比赛")
         title_font = QFont(title.font())
         title_font.setPixelSize(22)
@@ -459,6 +467,13 @@ class TournamentWidget(QWidget):
         self.upload_dialog.show()
         self.upload_dialog.raise_()
         self.upload_history_requested.emit()
+
+    @property
+    def upload_notice_message(self) -> str:
+        return self._upload_notice.text()
+
+    def show_upload_notice(self, message: str):
+        self._upload_notice.show_message(message)
 
     def _analysis_hint(self, tournament: Tournament | None) -> str:
         if tournament is None or not tournament.is_ongoing():
