@@ -1,14 +1,12 @@
 from datetime import datetime, timezone
 
-from PySide6.QtGui import QDesktopServices
-
 from openms_tournament.analysis import ScoreVideo, analyze_personal
 from openms_tournament.analysis_dialog import PersonalAnalysisDialog
 from openms_tournament.client import LoginUser, Snapshot, Tournament
 from openms_tournament.widgets import TournamentWidget
 
 
-def test_dialog_shows_counted_and_default_slots_and_links_to_only_real_videos(qtbot, monkeypatch):
+def test_dialog_shows_counted_and_default_slots_and_opens_only_real_videos(qtbot):
     tournament = Tournament(30, '测试周赛', 'ongoing', None, None)
     dialog = PersonalAnalysisDialog()
     qtbot.addWidget(dialog)
@@ -19,11 +17,11 @@ def test_dialog_shows_counted_and_default_slots_and_links_to_only_real_videos(qt
     assert '计入 1 / 7' in dialog.count_label.text()
     assert dialog.slot_table.rowCount() == 7
     assert dialog.slot_table.item(1, 5).text() == '补位（规则上限）'
-    urls = []
-    monkeypatch.setattr(QDesktopServices, 'openUrl', lambda url: urls.append(url.toString()))
+    videos = []
+    dialog.replay_requested.connect(videos.append)
     dialog._open_video(dialog.slot_table.item(0, 0))
     dialog._open_video(dialog.slot_table.item(1, 0))
-    assert urls == ['https://openms.top/video/123']
+    assert [video.id for video in videos] == [123]
     dialog.show_error('network down')
     assert dialog.slot_table.rowCount() == 0 and dialog.total_label.text() == ''
     assert dialog.status_label.text() == 'network down'

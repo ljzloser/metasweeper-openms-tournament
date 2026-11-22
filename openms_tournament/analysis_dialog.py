@@ -2,24 +2,25 @@
 from __future__ import annotations
 from datetime import timedelta, timezone
 
-from PySide6.QtCore import QEvent, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QPalette
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QFont, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QPushButton,
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel, QPushButton, QSplitter,
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from .analysis import LEVEL_NAMES, STATE_NAMES, PersonalAnalysis
+from .analysis import LEVEL_NAMES, STATE_NAMES, PersonalAnalysis, ScoreVideo
 from .client import Tournament
 
 
 class PersonalAnalysisDialog(QDialog):
     refresh_requested = Signal(int)
+    replay_requested = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('我的比赛成绩')
-        self.resize(900, 620)
+        self.resize(1160, 640)
         self.tournament_id: int | None = None
         self.user_id: int | None = None
         layout = QVBoxLayout(self)
@@ -48,14 +49,30 @@ class PersonalAnalysisDialog(QDialog):
         self.count_label.setWordWrap(True)
         layout.addWidget(self.count_label)
         self.tabs = QTabWidget()
-        overview = QWidget()
+        comparison = QSplitter(Qt.Orientation.Horizontal)
+        comparison.setChildrenCollapsible(False)
+        overview = QWidget(comparison)
         overview_layout = QVBoxLayout(overview)
-        self.group_table = self._table(['难度', '计入 / 需求', '补位', '最好', '边界（含补位）', '小计'])
-        self.group_table.setMaximumHeight(145)
+        overview_layout.addWidget(QLabel('当前计分明细'))
+        group_headers = ['难度', '计入 / 需求', '补位', '最好', '边界（含补位）', '小计']
+        slot_headers = ['难度', '序号', '用时（秒）', 'IOE', '本局计分', '录像 / 补位']
+        self.group_table = self._table(group_headers)
         overview_layout.addWidget(self.group_table)
-        self.slot_table = self._table(['难度', '序号', '用时（秒）', 'IOE', '本局计分', '录像 / 补位'])
+        self.slot_table = self._table(slot_headers)
         overview_layout.addWidget(self.slot_table, 1)
-        self.tabs.addTab(overview, '计分明细')
+        estimate = QWidget(comparison)
+        estimate_layout = QVBoxLayout(estimate)
+        self.estimate_title = QLabel('预计成绩')
+        estimate_font = self.estimate_title.font()
+        estimate_font.setBold(True)
+        self.estimate_title.setFont(estimate_font)
+        estimate_layout.addWidget(self.estimate_title)
+        self.estimated_group_table = self._table(group_headers)
+        self.estimated_slot_table = self._table(slot_headers)
+        estimate_layout.addWidget(self.estimated_group_table)
+        estimate_layout.addWidget(self.estimated_slot_table, 1)
+        comparison.setSizes([570, 570])
+        self.tabs.addTab(comparison, '计分明细')
         self.video_table = self._table(['录像 ID', '难度', '模式', '网站状态', '用时（秒）', '3BV', 'IOE', '计分', '计入情况 / 原因'])
         self.tabs.addTab(self.video_table, '已提交录像')
         reference_panel = QWidget()
@@ -73,9 +90,10 @@ class PersonalAnalysisDialog(QDialog):
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.status_label)
         self.slot_table.itemDoubleClicked.connect(self._open_video)
+        self.estimated_slot_table.itemDoubleClicked.connect(self._open_video)
         self.video_table.itemDoubleClicked.connect(self._open_video)
         footer = QHBoxLayout()
-        footer.addWidget(QLabel('双击有录像 ID 的计分项或录像行，可打开网站录像。'))
+        footer.addWidget(QLabel('双击计分项或录像行，可在元扫雷中播放。'))
         footer.addStretch(1)
         close_button = QPushButton('关闭')
         close_button.clicked.connect(self.close)
@@ -110,21 +128,18 @@ class PersonalAnalysisDialog(QDialog):
         return table
 
     @staticmethod
-    def _fill(table: QTableWidget, rows: list[tuple[list[str], int | None]]):
+    def _fill(table: QTableWidget, rows: list[tuple[list[str], ScoreVideo | None]]):
         table.setRowCount(len(rows))
-        for row, (values, video_id) in enumerate(rows):
+        for row, (values, video) in enumerate(rows):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
-                item.setData(Qt.ItemDataRole.UserRole, video_id)
+                item.setData(Qt.ItemDataRole.UserRole, video)
                 table.setItem(row, column, item)
 
     def clear(self):
         self.tournament_id = self.user_id = None
-        for table in (self.group_table, self.slot_table, self.video_table, self.reference_table):
-            table.setRowCount(0)
-        for label in (self.total_label, self.rule_label, self.count_label):
-            label.clear()
+        self._clear_scores()
         self.heading_label.setText('请选择比赛')
         self.status_label.setProperty('error', False)
         self._apply_theme_colors()
@@ -141,14 +156,48 @@ class PersonalAnalysisDialog(QDialog):
         self.status_label.setText('正在读取网站已提交录像并计算个人成绩…')
 
     def show_error(self, message: str):
-        for table in (self.group_table, self.slot_table, self.video_table, self.reference_table):
+        self._clear_scores()
+        self.show_replay_status(message, error=True)
+        self.refresh_button.setEnabled(self.tournament_id is not None)
+
+    def _clear_scores(self):
+        for table in (self.group_table, self.slot_table, self.video_table, self.reference_table,
+                      self.estimated_group_table, self.estimated_slot_table):
             table.setRowCount(0)
         for label in (self.total_label, self.rule_label, self.count_label):
             label.clear()
-        self.status_label.setProperty('error', True)
+        self.estimate_title.setText('预计成绩')
+
+    def show_replay_status(self, message: str, error: bool = False):
+        self.status_label.setProperty('error', error)
         self._apply_theme_colors()
         self.status_label.setText(message)
-        self.refresh_button.setEnabled(self.tournament_id is not None)
+
+    def _fill_scores(self, group_table, slot_table, score_groups, unit):
+        groups, slots = [], []
+        for group in score_groups:
+            groups.append(([LEVEL_NAMES[group.level], f'{group.selected_count} / {len(group.slots)}',
+                            str(len(group.slots) - group.selected_count), f'{group.slots[0].value:.3f}',
+                            f'{group.slots[-1].value:.3f}', f'{group.total:.3f}{unit}'], None))
+            for index, slot in enumerate(group.slots, 1):
+                video = slot.video
+                if video is None:
+                    source = '补位（规则上限）'
+                elif video.local_digest:
+                    source = '本地未上传'
+                elif video.state == 'unlinked':
+                    source = f'#{video.id} · 等待关联'
+                else:
+                    state = STATE_NAMES.get(video.state, video.state)
+                    source = f'#{video.id}' if video.state == 'c' else f'#{video.id} · {state}'
+                slots.append(([LEVEL_NAMES[group.level], str(index), f'{video.seconds:.3f}' if video else '—',
+                               f'{video.ioe:.3f}' if video and video.ioe is not None else '—',
+                               f'{slot.value:.3f}{unit}', source], video))
+        self._fill(group_table, groups)
+        group_table.setFixedHeight(group_table.horizontalHeader().height()
+                                   + sum(group_table.rowHeight(row) for row in range(group_table.rowCount()))
+                                   + 2 * group_table.frameWidth())
+        self._fill(slot_table, slots)
 
     def show_analysis(self, result: PersonalAnalysis):
         if (self.tournament_id, self.user_id) != (result.tournament.id, result.user_id):
@@ -156,6 +205,7 @@ class PersonalAnalysisDialog(QDialog):
         efficiency = result.tournament.subclass == 'e'
         unit = '' if efficiency else ' 秒'
         self.total_label.setText(f'当前{"效率总分" if efficiency else "总成绩"}：{result.total:.3f}{unit}')
+        self.estimate_title.setText(f'预计成绩：{result.estimated_total:.3f}{unit}')
         rules = {
             'w': '竞速周赛：取最快的 5 局中级和 2 局高级；中级须低于 60 秒，高级须低于 240 秒，缺项按上限补足。',
             'e': '效率周赛：每局计分 = 用时（秒）÷ IOE²，IOE = 3BV ÷ 点击数。取中级最低 5 局、高级最低 2 局；缺项按 60 / 240 补足。计算使用原始精度。',
@@ -165,39 +215,25 @@ class PersonalAnalysisDialog(QDialog):
         counted = sum(video.counted for video in result.videos)
         required = sum(len(group.slots) for group in result.groups)
         self.count_label.setText(f'网站已关联录像 {len(result.videos)} 局 · 计入 {counted} / {required} 局 · 补位 {required - counted} 项')
-        groups, slots = [], []
-        for group in result.groups:
-            groups.append(([LEVEL_NAMES[group.level], f'{group.selected_count} / {len(group.slots)}',
-                            str(len(group.slots) - group.selected_count), f'{group.slots[0].value:.3f}',
-                            f'{group.slots[-1].value:.3f}', f'{group.total:.3f}{unit}'], None))
-            for index, slot in enumerate(group.slots, 1):
-                video = slot.video
-                slots.append(([LEVEL_NAMES[group.level], str(index), f'{video.seconds:.3f}' if video else '—',
-                               f'{video.ioe:.3f}' if video and video.ioe is not None else '—',
-                               f'{slot.value:.3f}{unit}', f'#{video.id}' if video else '补位（规则上限）'], video.id if video else None))
-        self._fill(self.group_table, groups)
-        self.group_table.setFixedHeight(
-            self.group_table.horizontalHeader().height()
-            + sum(self.group_table.rowHeight(row) for row in range(self.group_table.rowCount()))
-            + 2 * self.group_table.frameWidth())
-        self._fill(self.slot_table, slots)
+        self._fill_scores(self.group_table, self.slot_table, result.groups, unit)
+        self._fill_scores(self.estimated_group_table, self.estimated_slot_table,
+                          result.estimated_groups or result.groups, unit)
         rows = []
         for assessment in result.videos:
             video = assessment.video
             rows.append(([str(video.id), LEVEL_NAMES.get(video.level, video.level),
                           '标准' if video.mode == '00' else video.mode, STATE_NAMES.get(video.state, video.state),
                           f'{video.seconds:.3f}', str(video.bv), f'{video.ioe:.3f}' if video.ioe is not None else '—',
-                          f'{assessment.value:.3f}' if assessment.value is not None else '—', assessment.reason], video.id))
+                          f'{assessment.value:.3f}' if assessment.value is not None else '—', assessment.reason], video))
         self._fill(self.video_table, rows)
         self._fill(self.reference_table, [([LEVEL_NAMES[group.level], group.metric, str(len(group.values)),
                                            str(group.missing), f'{group.total:.3f}',
                                            ', '.join(f'#{video_id}' for video_id, _ in group.values)], None)
                                          for group in result.references])
         self.tabs.setTabVisible(2, bool(result.references))
-        self.status_label.setProperty('error', False)
-        self._apply_theme_colors()
-        self.status_label.setText(
-            f'基于网站已关联录像计算，非最终结算。未上传或尚未关联的本地录像不计入。读取时间：{result.fetched_at.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")}（北京时间）。')
+        self.show_replay_status(
+            '预计成绩假设符合规则的本地及待审核录像最终获准计分。'
+            f' 网站读取时间：{result.fetched_at.astimezone(timezone(timedelta(hours=8))).strftime("%H:%M:%S")}（北京时间）。')
         self.refresh_button.setEnabled(True)
 
     def _refresh(self):
@@ -205,6 +241,6 @@ class PersonalAnalysisDialog(QDialog):
             self.refresh_requested.emit(self.tournament_id)
 
     def _open_video(self, item: QTableWidgetItem):
-        video_id = item.data(Qt.ItemDataRole.UserRole)
-        if isinstance(video_id, int) and video_id > 0:
-            QDesktopServices.openUrl(QUrl(f'https://openms.top/video/{video_id}'))
+        video = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(video, ScoreVideo):
+            self.replay_requested.emit(video)

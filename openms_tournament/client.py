@@ -3,16 +3,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.message import Message
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 from threading import RLock
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from copy import deepcopy
 
 import requests
 from .request_policy import OpenmsError, RateLimitError, RequestPolicy
+
+if TYPE_CHECKING:
+    from .analysis import PersonalAnalysis
 
 BASE_URL = "https://openms.top"
 KEYRING_SERVICE = "metasweeper-openms-tournament"
@@ -107,6 +111,7 @@ class Snapshot:
     user_id: int | None
     fetched_at: datetime
     participants: tuple[tuple[int, Participant | None], ...] = ()
+    analyses: tuple[PersonalAnalysis, ...] = ()
 
     def participant_for(self, tournament_id: int) -> Participant | None:
         return next((participant for item_id, participant in self.participants
@@ -148,16 +153,16 @@ class OpenmsClient:
             self._get_cache.clear()
             self._session.close()
 
-    def _request(self, method: str, path: str, *, image: bool = False, **kwargs) -> Any:
+    def _request(self, method: str, path: str, *, image: bool = False, replay: bool = False, **kwargs) -> Any:
         try:
             with self._lock:
-                self._policy.before_request(path)
+                self._policy.before_request('/api/video/download/' if replay else path)
                 if method != 'GET':
                     self._get_cache.clear()
                 request = (self._request_get or self._session.get) if method == "GET" else self._session.post
                 with request(
                     BASE_URL + path, timeout=self.timeout, allow_redirects=False,
-                    headers={"Accept": "image/png" if image else "application/json",
+                    headers={"Accept": "image/png" if image else "application/octet-stream" if replay else "application/json",
                              "User-Agent": "MetaSweeper-OpenmsTournament/1.0",
                              "Origin": BASE_URL, "Referer": BASE_URL + "/"},
                     **kwargs,
@@ -172,6 +177,8 @@ class OpenmsClient:
                         if not response.content.startswith(b"\x89PNG\r\n\x1a\n") or len(response.content) > 1_000_000:
                             raise OpenmsError("OpenMS 返回的验证码图片格式不正确。")
                         return response.content
+                    if replay:
+                        return self._read_replay(response)
                     if path == "/userprofile/logout/":
                         return None
                     return response.json()
@@ -219,6 +226,27 @@ class OpenmsClient:
 
     def cooldown_remaining(self) -> float:
         return self._policy.cooldown_remaining()
+
+    def download_replay(self, video_id: int) -> tuple[str, bytes]:
+        return self._request('GET', f'/api/video/download/{positive_id(video_id)}', replay=True, stream=True)
+
+    @staticmethod
+    def _read_replay(response: requests.Response) -> tuple[str, bytes]:
+        media_type = response.headers.get('Content-Type', '').partition(';')[0].strip().lower()
+        disposition = Message()
+        disposition['Content-Disposition'] = response.headers.get('Content-Disposition', '')
+        suffix = PureWindowsPath(disposition.get_filename() or '').suffix.lower()
+        if (suffix not in {'.avf', '.evf', '.evfs', '.mvf', '.rmv'}
+                or media_type.startswith('text/') or media_type.endswith(('json', 'xml'))):
+            raise OpenmsError('OpenMS 返回的文件不是支持的扫雷录像。')
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            content.extend(chunk)
+            if len(content) > 32 * 1024 * 1024:
+                raise OpenmsError('OpenMS 录像超过 32 MiB，无法打开。')
+        if not content:
+            raise OpenmsError('OpenMS 返回了空录像。')
+        return suffix, bytes(content)
 
     def _get(self, path: str, *, fresh: bool = False, **params: Any) -> Any:
         ttl = {'/api/tournament/get_list': 3.0, '/api/tournament/participants': 2.0,

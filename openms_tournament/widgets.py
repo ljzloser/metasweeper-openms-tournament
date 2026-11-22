@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from .client import Captcha, LoginUser, Participant, Snapshot, Tournament
+from .analysis import PersonalAnalysis, supports_scoring
 from .analysis_dialog import PersonalAnalysisDialog
 
 CHINA_TIME = timezone(timedelta(hours=8))
@@ -38,6 +39,7 @@ class TournamentWidget(QWidget):
     upload_history_requested = Signal()
     retry_uploads_requested = Signal()
     analysis_requested = Signal(int)
+    replay_requested = Signal(object)
 
     def __init__(self, user_id: int = 0, username: str = "", auto_manage: bool = True, auto_upload: bool = False):
         super().__init__()
@@ -54,6 +56,7 @@ class TournamentWidget(QWidget):
         self._has_captcha = False
         self._participants: dict[int, Participant | None] = {}
         self._tournaments: dict[int, Tournament] = {}
+        self._personal_scores: dict[int, PersonalAnalysis] = {}
         self._has_participant_identity = False
         self._checkin_busy: set[int] = set()
         self._checkin_all_busy = False
@@ -171,6 +174,7 @@ class TournamentWidget(QWidget):
         self.upload_history_button.clicked.connect(self._open_upload_history)
         self.analysis_dialog = PersonalAnalysisDialog(self)
         self.analysis_dialog.refresh_requested.connect(self.analysis_requested)
+        self.analysis_dialog.replay_requested.connect(self.replay_requested)
         self.analysis_button = QPushButton("我的成绩")
         self.analysis_button.setToolTip("先选择比赛，查看本人已提交录像的计分明细；需要登录。")
         self.analysis_button.clicked.connect(self._open_analysis)
@@ -209,9 +213,9 @@ class TournamentWidget(QWidget):
         close_uploads_button.clicked.connect(self.upload_dialog.close)
         upload_buttons.addWidget(close_uploads_button)
         upload_layout.addLayout(upload_buttons)
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["状态", "比赛", "比赛标识", "我已打卡", "打卡倒计时", "开始时间", "结束时间"])
+            ["状态", "比赛", "比赛标识", "我已打卡", "打卡倒计时", "开始时间", "结束时间", "当前成绩", "预计成绩"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -292,7 +296,7 @@ class TournamentWidget(QWidget):
         selected = self.table.item(self.table.currentRow(), 0)
         tournament = self._tournaments.get(selected.data(Qt.ItemDataRole.UserRole)) if selected is not None else None
         self.analysis_button.setEnabled(
-            logged_in and tournament is not None and tournament.phase == "ongoing"
+            logged_in and tournament is not None and tournament.is_ongoing() and supports_scoring(tournament)
             and not self._busy and not self._auth_busy)
         self.analysis_dialog.refresh_button.setEnabled(
             logged_in and self.analysis_dialog.tournament_id is not None and not self._busy and not self._auth_busy)
@@ -381,9 +385,12 @@ class TournamentWidget(QWidget):
         self._update_actions()
 
     def show_login_user(self, user: LoginUser | None, message: str = ""):
-        if self._login_user != user:
+        changed = self._login_user != user
+        if changed:
             self.clear_analysis()
         self._login_user = user
+        if changed:
+            self.show_scores(())
         self.password_edit.clear()
         self.invalidate_captcha()
         if user:
@@ -452,6 +459,26 @@ class TournamentWidget(QWidget):
 
     def show_analysis_error(self, message: str):
         self.analysis_dialog.show_error(message)
+
+    def show_replay_status(self, message: str, error: bool = False):
+        self.analysis_dialog.show_replay_status(message, error)
+
+    def show_scores(self, scores: tuple[PersonalAnalysis, ...]):
+        self._personal_scores = {item.tournament.id: item for item in scores
+                                 if self._login_user and item.user_id == self._login_user.id}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None:
+                self._update_score_row(row, item.data(Qt.ItemDataRole.UserRole))
+
+    def _update_score_row(self, row: int, tournament_id: int):
+        tournament = self._tournaments.get(tournament_id)
+        score = self._personal_scores.get(tournament_id) if tournament and tournament.is_ongoing() else None
+        unit = " 秒" if tournament and tournament.subclass != "e" else ""
+        for column, value in ((7, score.total if score else None), (8, score.estimated_total if score else None)):
+            item = self.table.item(row, column)
+            if item is not None:
+                item.setText(f"{value:.3f}{unit}" if value is not None else "—")
 
     def clear_analysis(self):
         self.analysis_dialog.clear()
@@ -591,7 +618,7 @@ class TournamentWidget(QWidget):
                 attendance = self._participants.get(tournament.id)
                 texts = (phase, f"{tournament.title}  ·  #{tournament.id}",
                          self._participant_token_text(attendance), "", "",
-                         format_time(tournament.starts_at), format_time(tournament.ends_at))
+                         format_time(tournament.starts_at), format_time(tournament.ends_at), "—", "—")
                 for column, text in enumerate(texts):
                     item = QTableWidgetItem(text)
                     item.setData(Qt.ItemDataRole.UserRole, tournament.id)
@@ -620,6 +647,7 @@ class TournamentWidget(QWidget):
                 cell_layout.addWidget(checkin)
                 self.table.setCellWidget(row, 3, cell)
                 self._update_countdown_row(row, tournament.id)
+                self._update_score_row(row, tournament.id)
         finally:
             self.table.blockSignals(False)
         if selected_id is not None:
@@ -725,7 +753,9 @@ class TournamentWidget(QWidget):
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item is not None:
-                self._update_countdown_row(row, item.data(Qt.ItemDataRole.UserRole))
+                tournament_id = item.data(Qt.ItemDataRole.UserRole)
+                self._update_countdown_row(row, tournament_id)
+                self._update_score_row(row, tournament_id)
 
     def set_checkin_busy(self, tournament_id: int, busy: bool):
         if busy:

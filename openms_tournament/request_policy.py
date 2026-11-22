@@ -49,6 +49,8 @@ class RequestPolicy:
         self._next_request = now + 1.0
         if path == '/api/tournament/weekly-eff/participant':
             self._endpoint_next[path] = now + 2.1
+        if path == '/api/video/download/':
+            self._endpoint_next[path] = now + 3.1
         if path in ('/userprofile/login/', '/userprofile/refresh_captcha/'):
             self._hourly[path].append(now)
 

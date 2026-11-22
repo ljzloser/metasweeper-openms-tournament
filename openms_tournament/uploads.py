@@ -10,6 +10,8 @@ from pathlib import Path
 import sqlite3
 import time
 
+from .analysis import ScoreVideo
+
 
 @dataclass(frozen=True)
 class UploadJob:
@@ -41,6 +43,9 @@ class UploadQueue:
             columns = {row['name'] for row in database.execute('PRAGMA table_info(uploads)')}
             if 'tournament_ids' not in columns:
                 database.execute("ALTER TABLE uploads ADD COLUMN tournament_ids TEXT NOT NULL DEFAULT '[]'")
+            for column, kind in (('level', 'TEXT'), ('timems', 'INTEGER'), ('bv', 'INTEGER'), ('clicks', 'INTEGER')):
+                if column not in columns:
+                    database.execute(f"ALTER TABLE uploads ADD COLUMN {column} {kind}")
             database.execute("UPDATE uploads SET status='pending', message='恢复中断的上传，等待确认' WHERE status='uploading'")
         self.purge_expired()
 
@@ -56,15 +61,45 @@ class UploadQueue:
             database.close()
 
     def enqueue(self, user_id: int, raw_data: bytes, tokens: tuple[str, ...], deadline: float | None,
-                tournament_ids: tuple[int, ...] = ()) -> bool:
+                tournament_ids: tuple[int, ...] = (), *, level: str | None = None,
+                timems: int | None = None, bv: int | None = None, clicks: int | None = None) -> bool:
         digest = hashlib.sha256(raw_data).hexdigest()
         now = time.time()
         filename = datetime.fromtimestamp(now, timezone.utc).strftime('%Y%m%d-%H%M%S-') + digest[:12] + '.evf'
         with self._connect() as database:
             cursor = database.execute("""INSERT OR IGNORE INTO uploads
-                (digest,user_id,filename,tokens,deadline,created,raw_data,tournament_ids) VALUES (?,?,?,?,?,?,?,?)""",
-                (digest, user_id, filename, json.dumps(tokens), deadline, now, raw_data, json.dumps(tournament_ids)))
+                (digest,user_id,filename,tokens,deadline,created,raw_data,tournament_ids,level,timems,bv,clicks)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (digest, user_id, filename, json.dumps(tokens), deadline, now, raw_data,
+                 json.dumps(tournament_ids), level, timems, bv, clicks))
             return cursor.rowcount == 1
+
+    def score_videos(self, user_id: int, tournament_id: int, *, can_upload: bool) -> tuple[ScoreVideo, ...]:
+        with self._connect() as database:
+            rows = database.execute("""SELECT rowid, digest, tournament_ids, status, video_id, website_state,
+                level, timems, bv, clicks FROM uploads WHERE user_id=? AND level IS NOT NULL
+                AND timems IS NOT NULL AND bv IS NOT NULL AND (deadline IS NULL OR deadline>?)
+                AND (status='succeeded' OR (? AND raw_data IS NOT NULL
+                     AND status IN ('pending','retry','uploading','failed')))""",
+                                    (user_id, time.time(), can_upload)).fetchall()
+        videos = {}
+        for row in rows:
+            if tournament_id not in json.loads(row['tournament_ids']):
+                continue
+            uploaded = row['status'] == 'succeeded'
+            if uploaded and (not row['video_id'] or row['website_state'] not in ('', 'a', 'c', 'e')):
+                continue
+            video_id = row['video_id'] if uploaded else -row['rowid']
+            videos[video_id] = ScoreVideo(video_id, row['level'], '00', 'unlinked' if uploaded else 'local',
+                                          row['timems'], row['bv'], row['clicks'],
+                                          '' if uploaded else row['digest'])
+        return tuple(videos.values())
+
+    def replay_bytes(self, user_id: int, digest: str) -> bytes | None:
+        with self._connect() as database:
+            row = database.execute("""SELECT raw_data FROM uploads WHERE user_id=? AND digest=?
+                AND (deadline IS NULL OR deadline>?)""", (user_id, digest, time.time())).fetchone()
+        return row['raw_data'] if row else None
 
     def purge_expired(self, now: float | None = None) -> int:
         """Remove every expired task, including success/history and other accounts."""
