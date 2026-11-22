@@ -7,7 +7,7 @@ from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QHideEvent, QPalette, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel,
-    QInputDialog, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QLineEdit, QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -502,22 +502,56 @@ class TournamentWidget(QWidget):
         self.upload_dialog.raise_()
         self.upload_history_requested.emit()
 
-    def choose_manual_upload(self, choices: list[tuple[str, str]]):
+    def choose_manual_upload(self, choices: list[tuple[str, tuple[str, ...]]]):
         if not choices:
             QMessageBox.information(self, "手动上传", "当前没有可手动上传的本地比赛录像。"
                                     "需要已打卡且仍在个人上传时间内的正式公平标准模式胜局。")
             return
-        labels = {label: digest for digest, label in choices}
-        dialog = QInputDialog(self)
+        dialog = QDialog(self)
         dialog.setWindowTitle("手动上传比赛录像")
         dialog.setWindowIcon(ui_icon("upload"))
-        dialog.setLabelText("选择要提交到 OpenMS 的本地比赛录像：")
-        dialog.setComboBoxItems(list(labels))
-        dialog.setOkButtonText("加入上传队列")
-        dialog.setCancelButtonText("取消")
+        dialog.resize(680, 380)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("选择要提交到 OpenMS 的本地比赛录像。"))
+
+        headers = ("本地记录", "难度", "用时（秒）", "3BV", "比赛")
+        table = QTableWidget(len(choices), len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().hide()
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(len(headers) - 1, QHeaderView.ResizeMode.Stretch)
+        for row, (digest, values) in enumerate(choices):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, digest)
+                if column == len(headers) - 1:
+                    item.setToolTip(value)
+                table.setItem(row, column, item)
+        layout.addWidget(table, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = icon_button("取消", "cancel")
+        cancel.clicked.connect(dialog.reject)
+        buttons.addWidget(cancel)
+        submit = icon_button("加入上传队列", "upload")
+        submit.setEnabled(False)
+        submit.setDefault(True)
+        submit.clicked.connect(dialog.accept)
+        table.itemSelectionChanged.connect(lambda: submit.setEnabled(bool(table.selectedItems())))
+        buttons.addWidget(submit)
+        layout.addLayout(buttons)
+
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            digest = labels.get(dialog.textValue())
-            if digest is not None:
+            selected = table.selectedItems()
+            if selected:
+                digest = table.item(selected[0].row(), 0).data(Qt.ItemDataRole.UserRole)
                 self.manual_replay_selected.emit(digest)
         dialog.deleteLater()
 

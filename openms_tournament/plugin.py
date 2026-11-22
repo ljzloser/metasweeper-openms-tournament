@@ -59,7 +59,7 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
     @classmethod
     def plugin_info(cls) -> PluginInfo:
         return PluginInfo(
-            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.3",
+            name="openms_tournament", display_name="OpenMS 比赛", version="1.12.4",
             description="查看比赛、批量打卡、维护比赛标识、检查对局条件、上传录像并分析本人比赛成绩。",
             window_mode=WindowMode.TAB, other_info=TournamentConfig,
             icon=QIcon(str(Path(__file__).with_name("icon.svg"))),
@@ -785,8 +785,8 @@ class OpenmsTournamentPlugin(BasePlugin[TournamentConfig]):
         for row in rows:
             titles = "、".join(active[tournament_id] for tournament_id in row["tournament_ids"])
             level = LEVEL_NAMES.get(row["level"], "未知难度")
-            label = f"本地记录 #{row['rowid']} · {level} · {row['timems'] / 1000:.3f} 秒 · 3BV {row['bv']} · {titles}"
-            choices.append((row["digest"], label))
+            values = (f"#{row['rowid']}", level, f"{row['timems'] / 1000:.3f}", str(row["bv"]), titles)
+            choices.append((row["digest"], values))
         self._ui("choose_manual_upload", choices)
 
     @Slot(str)
